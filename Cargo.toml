@@ -1,0 +1,25 @@
+[package]
+name = "agent-discovery"
+version = "0.1.0"
+edition = "2021"
+description = "Agent discovery via audio FSK tones"
+
+[dependencies]
+cpal = "0.17"
+rustfft = "6.4"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+crc32fast = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+crossbeam-channel = "0.5"
+
+[dev-dependencies]
+tokio-test = "0.4"
