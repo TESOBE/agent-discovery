@@ -39,6 +39,8 @@ enum Commands {
         #[arg(short, long, default_value = "10")]
         duration: u64,
     },
+    /// Play a tone and try to decode it from the mic (tests the acoustic path)
+    TestRoundtrip,
 }
 
 #[tokio::main]
@@ -67,6 +69,9 @@ async fn main() -> Result<()> {
         }
         Commands::Decode { duration } => {
             audio::device::decode_from_mic(&config, duration)?;
+        }
+        Commands::TestRoundtrip => {
+            audio::device::test_roundtrip()?;
         }
     }
 

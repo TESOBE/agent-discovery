@@ -111,7 +111,7 @@ pub fn decode_frame(data: &[u8]) -> Option<Vec<u8>> {
                 if received_crc == computed_crc {
                     return Some(payload.to_vec());
                 } else {
-                    tracing::warn!(
+                    tracing::debug!(
                         "CRC mismatch: received={:#010X}, computed={:#010X}",
                         received_crc,
                         computed_crc

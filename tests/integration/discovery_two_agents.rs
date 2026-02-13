@@ -7,7 +7,8 @@ use uuid::Uuid;
 
 #[test]
 fn test_two_agents_discover_each_other() {
-    // Create two agents
+    // All agents share the same frequency channel.
+    // Self-echo is filtered by agent UUID.
     let agent1_id = Uuid::new_v4();
     let agent2_id = Uuid::new_v4();
 

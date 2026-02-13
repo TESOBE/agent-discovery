@@ -170,6 +170,132 @@ pub fn decode_from_mic(_config: &Config, duration_secs: u64) -> Result<()> {
     Ok(())
 }
 
+/// Play a tone through the speaker and simultaneously record from the mic,
+/// then try to decode it. Tests whether the acoustic path works.
+pub fn test_roundtrip() -> Result<()> {
+    use crate::audio::modulator::BANDS;
+
+    let test_payload = b"ROUNDTRIP_OK";
+    let frame_bytes = frame::encode_frame(test_payload);
+
+    println!("=== Audio Roundtrip Test ===");
+    println!("Will play a tone on each of the 9 bands and try to decode from mic.\n");
+
+    let host = cpal::default_host();
+    let output_device = host.default_output_device().context("No output device")?;
+    let input_device = host.default_input_device().context("No input device")?;
+
+    let out_name = output_device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "?".into());
+    let in_name = input_device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "?".into());
+    println!("Output: {}", out_name);
+    println!("Input:  {}", in_name);
+
+    let stream_config = cpal::StreamConfig {
+        channels: 1,
+        sample_rate: modulator::SAMPLE_RATE,
+        buffer_size: cpal::BufferSize::Default,
+    };
+
+    // Set up recording
+    let (rec_tx, rec_rx): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = bounded(4096);
+    let input_stream = input_device.build_input_stream(
+        &stream_config,
+        move |data: &[f32], _: &cpal::InputCallbackInfo| {
+            let _ = rec_tx.try_send(data.to_vec());
+        },
+        |err| eprintln!("Input error: {}", err),
+        None,
+    )?;
+    input_stream.play()?;
+
+    // Test each band
+    for (band_idx, band) in BANDS.iter().enumerate() {
+        let samples = modulator::modulate_bytes_freq(&frame_bytes, band);
+        let duration_secs = samples.len() as f32 / modulator::SAMPLE_RATE as f32;
+
+        print!("Band {} ({}/{}Hz): ", band_idx, band.mark, band.space);
+
+        // Drain any old mic data
+        while rec_rx.try_recv().is_ok() {}
+
+        // Small pre-recording silence to establish baseline
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        while rec_rx.try_recv().is_ok() {} // drain again
+
+        // Play the tone
+        let samples_arc = std::sync::Arc::new(samples);
+        let idx = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let s = samples_arc.clone();
+        let i = idx.clone();
+        let d = done.clone();
+
+        let output_stream = output_device.build_output_stream(
+            &stream_config,
+            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                for sample in data.iter_mut() {
+                    let cur = i.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if cur < s.len() {
+                        *sample = s[cur];
+                    } else {
+                        *sample = 0.0;
+                        d.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+            },
+            |err| eprintln!("Output error: {}", err),
+            None,
+        )?;
+        output_stream.play()?;
+
+        // Wait for playback to finish
+        while !done.load(std::sync::atomic::Ordering::Relaxed) {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // Extra time for echo/tail
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        drop(output_stream);
+
+        // Collect recorded samples
+        let mut recorded = Vec::new();
+        while let Ok(chunk) = rec_rx.try_recv() {
+            recorded.extend_from_slice(&chunk);
+        }
+
+        // Measure RMS
+        let rms: f32 = if recorded.is_empty() {
+            0.0
+        } else {
+            let sum_sq: f32 = recorded.iter().map(|s| s * s).sum();
+            (sum_sq / recorded.len() as f32).sqrt()
+        };
+
+        // Try to decode on this band
+        let bits = demodulator::demodulate_samples_freq(&recorded, band);
+        let bytes = modulator::bits_to_bytes(&bits);
+        let decoded = frame::decode_frame(&bytes);
+
+        match decoded {
+            Some(payload) if payload == test_payload => {
+                println!("OK (rms={:.4}, {:.1}s, {} samples recorded)", rms, duration_secs, recorded.len());
+            }
+            Some(payload) => {
+                println!("DECODED BUT WRONG (rms={:.4}, got {} bytes)", rms, payload.len());
+            }
+            None => {
+                println!("FAILED (rms={:.4}, {} samples recorded)", rms, recorded.len());
+            }
+        }
+    }
+
+    println!("\nIf all bands show FAILED with rms near 0, the mic is not picking up the speaker.");
+    println!("If rms > 0 but FAILED, the signal quality is too low for decoding.");
+    println!("If some bands show OK, audio discovery should work on those bands.");
+
+    Ok(())
+}
+
 /// AudioEngine manages sending and receiving FSK-modulated audio via cpal.
 pub struct AudioEngine {
     tx_sender: Sender<Vec<f32>>,
@@ -190,11 +316,24 @@ impl AudioEngine {
             .default_input_device()
             .context("No input audio device")?;
 
+        let out_name = output_device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "Unknown".into());
+        let in_name = input_device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "Unknown".into());
+        tracing::info!("Audio output device: {}", out_name);
+        tracing::info!("Audio input device: {}", in_name);
+
+        if let Ok(cfg) = output_device.default_output_config() {
+            tracing::info!("Output default config: {:?}", cfg);
+        }
+        if let Ok(cfg) = input_device.default_input_config() {
+            tracing::info!("Input default config: {:?}", cfg);
+        }
+
         let stream_config = cpal::StreamConfig {
             channels: 1,
             sample_rate: modulator::SAMPLE_RATE,
             buffer_size: cpal::BufferSize::Default,
         };
+        tracing::info!("Requesting stream config: {:?}", stream_config);
 
         // TX: samples to play
         let (tx_sender, tx_receiver): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = bounded(64);

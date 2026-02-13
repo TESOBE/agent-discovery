@@ -11,6 +11,7 @@ use uuid::Uuid;
 use crate::audio::demodulator;
 use crate::audio::device::LoopbackAudioEngine;
 use crate::audio::modulator;
+use crate::audio::modulator::{BANDS, NUM_BANDS};
 use crate::protocol::codec;
 use crate::protocol::frame;
 use crate::protocol::message::{Capabilities, DiscoveryMessage};
@@ -32,6 +33,8 @@ pub struct DiscoveryConfig {
     pub capabilities: Capabilities,
     pub announce_interval: Duration,
     pub jitter_max_ms: u64,
+    /// Which of the 9 frequency bands this agent transmits on (0-8).
+    pub tx_band: usize,
 }
 
 impl Default for DiscoveryConfig {
@@ -42,6 +45,7 @@ impl Default for DiscoveryConfig {
             capabilities: Capabilities::new().with_tcp().with_claude(),
             announce_interval: Duration::from_secs(5),
             jitter_max_ms: 1000,
+            tx_band: 0,
         }
     }
 }
@@ -85,19 +89,33 @@ impl DiscoveryManager {
         DiscoveryMessage::goodbye(self.config.agent_id)
     }
 
-    /// Encode a discovery message into FSK audio samples.
+    /// Encode a discovery message into FSK audio samples on this agent's TX band.
     pub fn encode_to_samples(&self, msg: &DiscoveryMessage) -> Vec<f32> {
         let msg_bytes = codec::encode_message(msg);
         let frame_bytes = frame::encode_frame(&msg_bytes);
-        modulator::modulate_bytes(&frame_bytes)
+        modulator::modulate_bytes_freq(&frame_bytes, &BANDS[self.config.tx_band])
     }
 
-    /// Process raw audio samples: demodulate, decode frame, decode message.
+    /// Try to decode audio samples by attempting all 9 frequency bands
+    /// at multiple bit-alignment offsets. The live mic signal won't be
+    /// aligned to our bit boundaries, so we try 16 evenly-spaced offsets
+    /// within one bit period (160 samples) for each band.
     pub fn decode_from_samples(&self, samples: &[f32]) -> Option<DiscoveryMessage> {
-        let bits = demodulator::demodulate_samples(samples);
-        let bytes = modulator::bits_to_bytes(&bits);
-        let payload = frame::decode_frame(&bytes)?;
-        codec::decode_message(&payload)
+        let step = (modulator::SAMPLES_PER_BIT as usize) / 16; // 10 samples
+        for band in 0..NUM_BANDS {
+            for offset_idx in 0..16 {
+                let offset = offset_idx * step;
+                let bits = demodulator::demodulate_samples_freq_at(samples, &BANDS[band], offset);
+                let bytes = modulator::bits_to_bytes(&bits);
+                if let Some(payload) = frame::decode_frame(&bytes) {
+                    if let Some(msg) = codec::decode_message(&payload) {
+                        tracing::info!(band, offset, "Decoded on band {} at offset {}", band, offset);
+                        return Some(msg);
+                    }
+                }
+            }
+        }
+        None
     }
 
     /// Process a received discovery message. Returns true if it was handled (not self-echo).
@@ -322,6 +340,7 @@ mod tests {
 
     #[test]
     fn test_encode_decode_roundtrip() {
+        // All agents share the same channel, so encode/decode roundtrips.
         let config = DiscoveryConfig::default();
         let (manager, _rx) = DiscoveryManager::new(config);
 
