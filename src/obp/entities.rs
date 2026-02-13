@@ -5,7 +5,7 @@
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use crate::mcp::client::StdioMcpClient;
+use crate::mcp::client::McpClient;
 use crate::obp::client::ObpClient;
 
 /// Dynamic entity definition for the agent registry.
@@ -42,7 +42,7 @@ pub fn agent_messages_entity() -> Value {
 
 /// Set up dynamic entities on the OBP instance via MCP.
 pub async fn setup_entities_via_mcp(
-    mcp_client: &mut StdioMcpClient,
+    mcp_client: &mut McpClient,
     bank_id: &str,
 ) -> Result<()> {
     tracing::info!("Setting up OBP dynamic entities via MCP");
@@ -109,7 +109,7 @@ pub async fn setup_entities_via_http(obp_client: &ObpClient) -> Result<()> {
 
 /// Register this agent in the OBP agent registry via MCP.
 pub async fn register_agent_via_mcp(
-    mcp_client: &mut StdioMcpClient,
+    mcp_client: &mut McpClient,
     bank_id: &str,
     agent_id: &str,
     agent_name: &str,
@@ -140,7 +140,7 @@ pub async fn register_agent_via_mcp(
 
 /// Send a message to another agent via OBP dynamic entities.
 pub async fn send_message_via_mcp(
-    mcp_client: &mut StdioMcpClient,
+    mcp_client: &mut McpClient,
     bank_id: &str,
     from_agent_id: &str,
     to_agent_id: &str,

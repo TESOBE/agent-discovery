@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::config::Config;
 use crate::discovery::peer::Peer;
-use crate::mcp::client::StdioMcpClient;
+use crate::mcp::client::McpClient;
 
 const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
 
@@ -90,7 +90,7 @@ impl ClaudeNegotiator {
         our_agent_id: &str,
         our_address: &str,
         peer: &Peer,
-        mut mcp_client: Option<&mut StdioMcpClient>,
+        mut mcp_client: Option<&mut McpClient>,
     ) -> Result<NegotiationResult> {
         let system_prompt = format!(
             r#"You are an autonomous agent negotiation system. Two AI agents have discovered each other via audio FSK tones and need to decide how to communicate going forward.

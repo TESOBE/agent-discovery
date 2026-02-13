@@ -12,24 +12,19 @@ pub struct Config {
     pub obp_password: String,
     pub obp_consumer_key: String,
     pub obp_bank_id: String,
-    pub obp_mcp_server_command: String,
-    pub obp_mcp_server_args: Vec<String>,
+    /// URL of a running MCP server (streamable HTTP transport).
+    pub obp_mcp_server_url: Option<String>,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self> {
         dotenvy::dotenv().ok();
 
-        let mcp_args_str =
-            std::env::var("OBP_MCP_SERVER_ARGS").unwrap_or_else(|_| "obp-mcp-server".into());
-        let obp_mcp_server_args: Vec<String> =
-            mcp_args_str.split_whitespace().map(String::from).collect();
-
         Ok(Self {
             agent_name: std::env::var("AGENT_NAME")
                 .unwrap_or_else(|_| "agent-default".into()),
             agent_listen_port: std::env::var("AGENT_LISTEN_PORT")
-                .unwrap_or_else(|_| "9000".into())
+                .unwrap_or_else(|_| "7312".into())
                 .parse()
                 .context("AGENT_LISTEN_PORT must be a valid port number")?,
             claude_api_key: std::env::var("CLAUDE_API_KEY")
@@ -45,9 +40,8 @@ impl Config {
             obp_consumer_key: std::env::var("OBP_CONSUMER_KEY").unwrap_or_default(),
             obp_bank_id: std::env::var("OBP_BANK_ID")
                 .unwrap_or_else(|_| "gh.29.uk".into()),
-            obp_mcp_server_command: std::env::var("OBP_MCP_SERVER_COMMAND")
-                .unwrap_or_else(|_| "uvx".into()),
-            obp_mcp_server_args,
+            obp_mcp_server_url: Some(std::env::var("OBP_MCP_SERVER_URL")
+                .unwrap_or_else(|_| "http://0.0.0.0:9100/mcp".into())),
         })
     }
 }

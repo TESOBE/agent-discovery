@@ -10,7 +10,7 @@ use crate::comms::channel::CommChannel;
 use crate::comms::tcp::{TcpChannel, TcpCommListener};
 use crate::config::Config;
 use crate::discovery::manager::{DiscoveryConfig, DiscoveryEvent, DiscoveryManager};
-use crate::mcp::client::StdioMcpClient;
+use crate::mcp::client::McpClient;
 use crate::negotiation::claude::ClaudeNegotiator;
 use crate::obp::client::ObpClient;
 use crate::obp::entities;
@@ -38,7 +38,7 @@ pub async fn run(config: Config) -> Result<()> {
     }
 
     // Try to set up MCP client
-    let mcp_client = match StdioMcpClient::new(&config).await {
+    let mcp_client = match McpClient::new(&config).await {
         Ok(client) => {
             tracing::info!("MCP client connected, {} tools available", client.tools().len());
             capabilities = capabilities.with_obp();
@@ -210,31 +210,64 @@ pub async fn run(config: Config) -> Result<()> {
     Ok(())
 }
 
+/// Simple pseudo-random number using system time entropy.
+/// Returns a value in [0, max).
+fn pseudo_random(max: u64) -> u64 {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .subsec_nanos() as u64;
+    // Mix bits for better distribution
+    let mixed = nanos.wrapping_mul(6364136223846793005).wrapping_add(1);
+    mixed % max
+}
+
 /// Run the FSK announce loop.
 async fn run_announce_loop(
     manager: Arc<tokio::sync::Mutex<DiscoveryManager>>,
     engine: Arc<AudioEngine>,
 ) {
+    // Initial random delay so agents started at the same time don't collide
+    let startup_delay = pseudo_random(3000) + 500;
+    tracing::info!(
+        delay_ms = startup_delay,
+        "Announce loop starting after initial delay"
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(startup_delay)).await;
+
+    let mut announce_count: u64 = 0;
+
     loop {
-        let samples = {
+        announce_count += 1;
+
+        let (samples, duration_secs) = {
             let mgr = manager.lock().await;
             let msg = mgr.build_announce();
-            mgr.encode_to_samples(&msg)
+            let samples = mgr.encode_to_samples(&msg);
+            let duration = samples.len() as f32 / crate::audio::modulator::SAMPLE_RATE as f32;
+            (samples, duration)
         };
+
+        tracing::info!(
+            announce = announce_count,
+            duration_ms = format!("{:.0}", duration_secs * 1000.0),
+            "TX: Broadcasting announce tone"
+        );
 
         if let Err(e) = engine.send_samples(samples) {
-            tracing::error!("Failed to send announce: {}", e);
+            tracing::error!("TX: Failed to send announce: {}", e);
         }
 
-        // 4-6 second interval with jitter
-        let jitter_ms = {
-            let nanos = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos() as u64;
-            nanos % 2000
-        };
-        tokio::time::sleep(std::time::Duration::from_millis(4000 + jitter_ms)).await;
+        // Irregular interval: 3-8 seconds, heavily randomised to avoid collision
+        let base_ms = 3000u64;
+        let jitter_ms = pseudo_random(5000);
+        let sleep_ms = base_ms + jitter_ms;
+
+        tracing::debug!(
+            sleep_ms,
+            "TX: Sleeping before next announce"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(sleep_ms)).await;
     }
 }
 
@@ -244,23 +277,49 @@ async fn run_receive_loop(
     engine: Arc<AudioEngine>,
 ) {
     let mut sample_buffer = Vec::new();
+    let mut listen_chunks: u64 = 0;
+
+    tracing::info!("RX: Listening for FSK tones...");
 
     loop {
         // Collect samples
+        let mut new_samples = 0usize;
         while let Some(chunk) = engine.try_recv_samples() {
+            new_samples += chunk.len();
             sample_buffer.extend_from_slice(&chunk);
         }
 
+        if new_samples > 0 {
+            listen_chunks += 1;
+            if listen_chunks % 50 == 0 {
+                tracing::debug!(
+                    buffer_samples = sample_buffer.len(),
+                    buffer_secs = format!("{:.1}", sample_buffer.len() as f32 / crate::audio::modulator::SAMPLE_RATE as f32),
+                    "RX: Listening... (buffered audio)"
+                );
+            }
+        }
+
         // Try to decode when we have enough samples
-        // A typical frame is ~35 bytes * 8 bits * 160 samples/bit ≈ 44800 samples
+        // A typical frame is ~35 bytes * 8 bits * 160 samples/bit ~ 44800 samples
         if sample_buffer.len() > 10000 {
             let mut mgr = manager.lock().await;
             if let Some(msg) = mgr.decode_from_samples(&sample_buffer) {
+                tracing::info!(
+                    peer_id = %msg.agent_id,
+                    msg_type = ?msg.msg_type,
+                    address = %msg.address,
+                    "RX: Decoded FSK frame!"
+                );
                 mgr.handle_message(&msg);
                 sample_buffer.clear();
             } else if sample_buffer.len() > 200000 {
                 // Prevent unbounded growth, keep recent data
                 let drain = sample_buffer.len() - 100000;
+                tracing::debug!(
+                    trimming_samples = drain,
+                    "RX: Trimming old samples from buffer"
+                );
                 sample_buffer.drain(..drain);
             }
         }

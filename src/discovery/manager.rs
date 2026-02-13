@@ -38,7 +38,7 @@ impl Default for DiscoveryConfig {
     fn default() -> Self {
         Self {
             agent_id: Uuid::new_v4(),
-            agent_address: "127.0.0.1:9000".to_string(),
+            agent_address: "127.0.0.1:7312".to_string(),
             capabilities: Capabilities::new().with_tcp().with_claude(),
             announce_interval: Duration::from_secs(5),
             jitter_max_ms: 1000,

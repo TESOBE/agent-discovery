@@ -1,5 +1,5 @@
-/// MCP client: spawns the OBP MCP server as a subprocess (stdio transport)
-/// and communicates via JSON-RPC over stdin/stdout.
+/// MCP client: connects to a running MCP server via HTTP (streamable HTTP transport).
+/// Communicates via JSON-RPC.
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -14,56 +14,39 @@ pub struct McpTool {
     pub input_schema: Value,
 }
 
-/// MCP client that communicates with the OBP MCP server via stdio JSON-RPC.
-pub struct StdioMcpClient {
-    child: tokio::process::Child,
-    stdin: tokio::io::BufWriter<tokio::process::ChildStdin>,
-    stdout: tokio::io::BufReader<tokio::process::ChildStdout>,
+/// MCP client that connects to a running MCP server via HTTP.
+pub struct McpClient {
+    server_url: String,
+    http_client: reqwest::Client,
     request_id: u64,
     tools: Vec<McpTool>,
 }
 
-impl StdioMcpClient {
-    /// Spawn the OBP MCP server subprocess and initialize the MCP connection.
+impl McpClient {
+    /// Connect to a running MCP server. Requires `OBP_MCP_SERVER_URL` to be set.
     pub async fn new(config: &Config) -> Result<Self> {
-        use tokio::io::{BufReader, BufWriter};
-        use tokio::process::Command;
+        let server_url = config
+            .obp_mcp_server_url
+            .as_ref()
+            .context("OBP_MCP_SERVER_URL not set - point it at your running MCP server")?
+            .trim_end_matches('/')
+            .to_string();
 
-        tracing::info!(
-            command = %config.obp_mcp_server_command,
-            args = ?config.obp_mcp_server_args,
-            "Spawning OBP MCP server"
-        );
-
-        let mut child = Command::new(&config.obp_mcp_server_command)
-            .args(&config.obp_mcp_server_args)
-            .env("OBP_BASE_URL", &config.obp_base_url)
-            .env("OBP_API_VERSION", &config.obp_api_version)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .context("Failed to spawn OBP MCP server")?;
-
-        let stdin = child.stdin.take().context("No stdin on child")?;
-        let stdout = child.stdout.take().context("No stdout on child")?;
+        tracing::info!(url = %server_url, "Connecting to MCP server");
 
         let mut client = Self {
-            child,
-            stdin: BufWriter::new(stdin),
-            stdout: BufReader::new(stdout),
+            server_url,
+            http_client: reqwest::Client::new(),
             request_id: 0,
             tools: Vec::new(),
         };
 
-        // Initialize the MCP connection
         client.initialize().await?;
         client.discover_tools().await?;
 
         Ok(client)
     }
 
-    /// Send the MCP initialize request.
     async fn initialize(&mut self) -> Result<()> {
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -79,8 +62,7 @@ impl StdioMcpClient {
             }
         });
 
-        self.send_message(&request).await?;
-        let response = self.read_response().await?;
+        let response = self.send_request(&request).await?;
         tracing::info!("MCP initialized: {}", response);
 
         // Send initialized notification
@@ -88,12 +70,11 @@ impl StdioMcpClient {
             "jsonrpc": "2.0",
             "method": "notifications/initialized"
         });
-        self.send_message(&notification).await?;
+        self.send_notification(&notification).await?;
 
         Ok(())
     }
 
-    /// Discover available tools from the MCP server.
     async fn discover_tools(&mut self) -> Result<()> {
         let request = serde_json::json!({
             "jsonrpc": "2.0",
@@ -102,8 +83,7 @@ impl StdioMcpClient {
             "params": {}
         });
 
-        self.send_message(&request).await?;
-        let response = self.read_response().await?;
+        let response = self.send_request(&request).await?;
 
         if let Some(result) = response.get("result") {
             if let Some(tools) = result.get("tools").and_then(|t| t.as_array()) {
@@ -147,8 +127,7 @@ impl StdioMcpClient {
             }
         });
 
-        self.send_message(&request).await?;
-        let response = self.read_response().await?;
+        let response = self.send_request(&request).await?;
 
         if let Some(error) = response.get("error") {
             anyhow::bail!("MCP tool error: {}", error);
@@ -179,34 +158,40 @@ impl StdioMcpClient {
             .collect()
     }
 
-    async fn send_message(&mut self, msg: &Value) -> Result<()> {
-        use tokio::io::AsyncWriteExt;
-        let serialized = serde_json::to_string(msg)?;
-        self.stdin
-            .write_all(serialized.as_bytes())
-            .await?;
-        self.stdin.write_all(b"\n").await?;
-        self.stdin.flush().await?;
-        Ok(())
+    async fn send_request(&mut self, msg: &Value) -> Result<Value> {
+        let response = self
+            .http_client
+            .post(&self.server_url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json")
+            .json(msg)
+            .send()
+            .await
+            .context("Failed to send MCP request")?;
+
+        let status = response.status();
+        let body = response.text().await.context("Failed to read MCP response")?;
+
+        if !status.is_success() {
+            anyhow::bail!("MCP HTTP error ({}): {}", status, body);
+        }
+
+        serde_json::from_str(&body).context("Failed to parse MCP JSON-RPC response")
     }
 
-    async fn read_response(&mut self) -> Result<Value> {
-        use tokio::io::AsyncBufReadExt;
-        let mut line = String::new();
-        self.stdout.read_line(&mut line).await?;
-        let response: Value = serde_json::from_str(line.trim())?;
-        Ok(response)
+    async fn send_notification(&mut self, msg: &Value) -> Result<()> {
+        let _ = self
+            .http_client
+            .post(&self.server_url)
+            .header("Content-Type", "application/json")
+            .json(msg)
+            .send()
+            .await;
+        Ok(())
     }
 
     fn next_id(&mut self) -> u64 {
         self.request_id += 1;
         self.request_id
-    }
-}
-
-impl Drop for StdioMcpClient {
-    fn drop(&mut self) {
-        // Try to kill the child process
-        let _ = self.child.start_kill();
     }
 }
