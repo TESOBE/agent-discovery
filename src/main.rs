@@ -60,6 +60,10 @@ async fn main() -> Result<()> {
     let log_dir = &config.log_dir;
     std::fs::create_dir_all(log_dir)?;
 
+    // Clear the previous log file so each run starts fresh
+    let log_file_path = format!("{}/{}.log", log_dir, config.agent_name);
+    let _ = std::fs::write(&log_file_path, b"");
+
     let file_appender = tracing_appender::rolling::never(log_dir, format!("{}.log", config.agent_name));
     let (file_writer, _guard) = tracing_appender::non_blocking(file_appender);
 

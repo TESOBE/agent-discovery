@@ -1553,9 +1553,9 @@ async fn run_receive_loop(
         }
 
         // --- Binary chirp message decode (Stage 2) ---
-        // A binary chirp message is 44 bit-slots, each ~120ms = ~5.3 seconds of audio.
-        // We need at least ~5 seconds of buffered audio before attempting a decode.
-        let min_chirp_msg_samples = (sample_rate as f32 * 5.0) as usize;
+        // A binary chirp message is 44 bit-slots, each ~100ms = ~4.4 seconds of audio.
+        // We need at least ~4 seconds of buffered audio before attempting a decode.
+        let min_chirp_msg_samples = (sample_rate as f32 * 4.0) as usize;
         if sample_buffer.len() >= min_chirp_msg_samples {
             decode_attempts += 1;
             if let Some((port, caps)) = chirp::decode_chirp_message_sweep(&sample_buffer, sample_rate) {

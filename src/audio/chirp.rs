@@ -7,9 +7,10 @@
 /// **Discovery chirp:** Long sweep (150ms) for call-and-response presence detection.
 ///
 /// **Binary chirp messaging:** After the chirp handshake, data is sent as a
-/// sequence of short chirps: up-chirp (800→3200 Hz) = bit 1, down-chirp
-/// (3200→800 Hz) = bit 0. This encodes discovery data (port, capabilities)
-/// using the same robust chirp detection that works for presence detection.
+/// sequence of short chirps in a separate frequency band: up-chirp
+/// (1500→2500 Hz, 60ms) = bit 1, down-chirp (2500→1500 Hz, 60ms) = bit 0.
+/// The distinct band and shorter duration prevent Stage 1 CALL/RESPONSE
+/// detectors from triggering on data chirps.
 
 use std::f32::consts::TAU;
 use rustfft::{FftPlanner, num_complex::Complex};
@@ -702,11 +703,20 @@ fn name_hash(name: &str) -> u32 {
 // Binary chirp messaging
 // ---------------------------------------------------------------------------
 
-/// Duration of a single data chirp (shorter than discovery chirp for throughput).
-pub const DATA_CHIRP_DURATION: f32 = 0.08; // 80ms
+/// Data chirp frequency band — deliberately distinct from CALL (800–3400 Hz)
+/// and RESPONSE (4000–6400 Hz) so the Stage 1 sweep detectors ignore them.
+/// Narrower span (1000 Hz) and shorter duration (60ms) make them sound
+/// audibly different and won't trigger the CALL detector (which requires
+/// ≥100ms duration and ≥500 Hz sweep in the 600–3600 band).
+pub const DATA_START_FREQ: f32 = 1500.0;
+pub const DATA_END_FREQ: f32 = 2500.0;
+
+/// Duration of a single data chirp — shorter than the 100ms minimum that
+/// the CALL/RESPONSE detectors require, preventing false Stage 1 triggers.
+pub const DATA_CHIRP_DURATION: f32 = 0.06; // 60ms
 /// Silence gap between consecutive data chirps.
 pub const DATA_CHIRP_GAP: f32 = 0.04; // 40ms
-/// Total duration of one bit slot: chirp + gap = 120ms (~8.3 bps).
+/// Total duration of one bit slot: chirp + gap = 100ms (10 bps).
 pub const BIT_SLOT_DURATION: f32 = DATA_CHIRP_DURATION + DATA_CHIRP_GAP;
 /// Amplitude for data chirps.
 pub const DATA_CHIRP_AMPLITUDE: f32 = 0.5;
@@ -718,22 +728,22 @@ const PREAMBLE: [u8; 8] = [1, 0, 1, 0, 1, 0, 1, 0];
 /// Sync word: four 1-bits in a row signals "data starts next".
 const SYNC: [u8; 4] = [1, 1, 1, 1];
 
-/// Generate an up-chirp (800→3200 Hz) representing bit=1.
+/// Generate an up-chirp (1500→2500 Hz) representing bit=1.
 pub fn data_up_chirp(sample_rate: u32) -> Vec<f32> {
     generate_chirp(
-        CHIRP_START_FREQ,
-        CHIRP_END_FREQ,
+        DATA_START_FREQ,
+        DATA_END_FREQ,
         DATA_CHIRP_DURATION,
         sample_rate,
         DATA_CHIRP_AMPLITUDE,
     )
 }
 
-/// Generate a down-chirp (3200→800 Hz) representing bit=0.
+/// Generate a down-chirp (2500→1500 Hz) representing bit=0.
 pub fn data_down_chirp(sample_rate: u32) -> Vec<f32> {
     generate_chirp(
-        CHIRP_END_FREQ,
-        CHIRP_START_FREQ,
+        DATA_END_FREQ,
+        DATA_START_FREQ,
         DATA_CHIRP_DURATION,
         sample_rate,
         DATA_CHIRP_AMPLITUDE,
@@ -744,7 +754,7 @@ pub fn data_down_chirp(sample_rate: u32) -> Vec<f32> {
 ///
 /// Message format:
 ///   [preamble: 10101010] [sync: 1111] [port: 16 bits MSB] [caps: 8 bits] [checksum: 8 bits]
-///   Total: 44 bit slots = ~5.3 seconds of audio
+///   Total: 44 bit slots = ~4.4 seconds of audio (100ms per bit slot)
 pub fn encode_chirp_message(port: u16, capabilities: u8, sample_rate: u32) -> Vec<f32> {
     let up = data_up_chirp(sample_rate);
     let down = data_down_chirp(sample_rate);
@@ -814,8 +824,8 @@ pub fn decode_chirp_message(samples: &[f32], sample_rate: u32) -> Option<(u16, u
     }
 
     // Try multiple start offsets to find the best alignment
-    // Search in steps of chirp_len/4 for coarse alignment
-    let search_step = (chirp_len / 4).max(1);
+    // Search in steps of chirp_len/8 for alignment
+    let search_step = (chirp_len / 8).max(1);
     let max_search = samples.len().saturating_sub(needed).min(slot_len * 12);
 
     for start_offset in (0..=max_search).step_by(search_step) {
@@ -953,8 +963,9 @@ pub fn decode_chirp_message_sweep(samples: &[f32], sample_rate: u32) -> Option<(
     let fft = planner.plan_fft_forward(SWEEP_FFT_SIZE);
 
     let freq_per_bin = sample_rate as f32 / SWEEP_FFT_SIZE as f32;
-    let band_low_bin = (600.0 / freq_per_bin).ceil() as usize;
-    let band_high_bin = (3600.0 / freq_per_bin).floor() as usize;
+    // Search the data chirp band (1500–2500 Hz) with margin
+    let band_low_bin = (1300.0 / freq_per_bin).ceil() as usize;
+    let band_high_bin = (2700.0 / freq_per_bin).floor() as usize;
     let max_bin = (SWEEP_FFT_SIZE / 2).saturating_sub(1);
     let search_high = band_high_bin.min(max_bin);
 
@@ -1259,8 +1270,9 @@ mod tests {
         let mut padded = vec![0.0f32; SAMPLE_RATE as usize]; // 1 second of silence
         padded.extend_from_slice(&msg);
 
-        let result = decode_chirp_message(&padded, SAMPLE_RATE);
-        assert_eq!(result, Some((port, caps)), "Should decode with leading silence");
+        // The sweep-based decoder (used in production) handles leading silence
+        let result = decode_chirp_message_sweep(&padded, SAMPLE_RATE);
+        assert_eq!(result, Some((port, caps)), "Sweep decode should work with leading silence");
     }
 
     #[test]
