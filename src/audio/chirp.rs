@@ -12,6 +12,7 @@
 /// using the same robust chirp detection that works for presence detection.
 
 use std::f32::consts::TAU;
+use rustfft::{FftPlanner, num_complex::Complex};
 
 /// Chirp parameters for agent discovery (CALL chirp).
 pub const CHIRP_START_FREQ: f32 = 800.0;
@@ -376,6 +377,328 @@ impl AdaptiveThreshold {
 }
 
 // ---------------------------------------------------------------------------
+// Spectrogram-based chirp sweep detector
+// ---------------------------------------------------------------------------
+
+/// Result of spectrogram-based chirp sweep detection.
+#[derive(Debug, Clone)]
+pub struct DetectedChirp {
+    /// Detected start frequency (Hz)
+    pub start_freq: f32,
+    /// Detected end frequency (Hz)
+    pub end_freq: f32,
+    /// Detected duration (seconds)
+    pub duration_secs: f32,
+    /// Sample offset where the chirp starts
+    pub offset: usize,
+    /// Average spectral energy of the detected sweep (for logging)
+    pub energy: f32,
+}
+
+/// FFT window size for spectrogram analysis (~10.7ms at 48kHz).
+const SWEEP_FFT_SIZE: usize = 512;
+/// Hop size between frames (~2.7ms at 48kHz).
+const SWEEP_HOP_SIZE: usize = 128;
+
+/// Detect a chirp (upward frequency sweep) using spectrogram analysis.
+///
+/// Unlike template correlation, this detects ANY chirp regardless of exact
+/// frequencies. It computes a short-time FFT spectrogram and looks for a
+/// monotonically increasing peak frequency within the specified band.
+///
+/// Returns the detected chirp's parameters (start_freq, end_freq, duration)
+/// which can be compared against the agent's own signature for self-echo
+/// rejection.
+///
+/// Parameters:
+/// - `band_low`/`band_high`: frequency range to search (Hz)
+/// - `min_duration_secs`/`max_duration_secs`: valid chirp duration range
+/// - `min_sweep_hz`: minimum frequency span to qualify as a sweep
+pub fn detect_chirp_sweep(
+    samples: &[f32],
+    band_low: f32,
+    band_high: f32,
+    sample_rate: u32,
+    min_duration_secs: f32,
+    max_duration_secs: f32,
+    min_sweep_hz: f32,
+) -> Option<DetectedChirp> {
+    if samples.len() < SWEEP_FFT_SIZE {
+        return None;
+    }
+
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(SWEEP_FFT_SIZE);
+
+    let freq_per_bin = sample_rate as f32 / SWEEP_FFT_SIZE as f32;
+    let band_low_bin = (band_low / freq_per_bin).ceil() as usize;
+    let band_high_bin = (band_high / freq_per_bin).floor() as usize;
+    let max_bin = (SWEEP_FFT_SIZE / 2).saturating_sub(1);
+
+    if band_low_bin >= band_high_bin || band_high_bin > max_bin {
+        return None;
+    }
+    let search_high = band_high_bin.min(max_bin);
+
+    let num_frames = (samples.len().saturating_sub(SWEEP_FFT_SIZE)) / SWEEP_HOP_SIZE + 1;
+    if num_frames < 2 {
+        return None;
+    }
+
+    // Pre-compute Hanning window
+    let hanning: Vec<f32> = (0..SWEEP_FFT_SIZE)
+        .map(|i| 0.5 * (1.0 - (TAU * i as f32 / SWEEP_FFT_SIZE as f32).cos()))
+        .collect();
+
+    // Compute spectrogram: peak frequency and band energy per frame
+    let mut peak_freqs = Vec::with_capacity(num_frames);
+    let mut frame_energies = Vec::with_capacity(num_frames);
+
+    let mut scratch = vec![Complex { re: 0.0f32, im: 0.0 }; fft.get_inplace_scratch_len()];
+
+    for frame_idx in 0..num_frames {
+        let start = frame_idx * SWEEP_HOP_SIZE;
+        if start + SWEEP_FFT_SIZE > samples.len() {
+            break;
+        }
+        let frame = &samples[start..start + SWEEP_FFT_SIZE];
+
+        let mut buffer: Vec<Complex<f32>> = frame
+            .iter()
+            .zip(hanning.iter())
+            .map(|(&s, &w)| Complex { re: s * w, im: 0.0 })
+            .collect();
+
+        fft.process_with_scratch(&mut buffer, &mut scratch);
+
+        // Find peak magnitude and bin in the search band
+        let mut max_mag = 0.0f32;
+        let mut max_bin_idx = band_low_bin;
+        for bin in band_low_bin..=search_high {
+            let mag = buffer[bin].norm();
+            if mag > max_mag {
+                max_mag = mag;
+                max_bin_idx = bin;
+            }
+        }
+
+        // Parabolic interpolation for sub-bin frequency accuracy
+        let refined_freq =
+            if max_bin_idx > band_low_bin && max_bin_idx < search_high {
+                let alpha = buffer[max_bin_idx - 1].norm();
+                let beta = buffer[max_bin_idx].norm();
+                let gamma = buffer[max_bin_idx + 1].norm();
+                let denom = alpha - 2.0 * beta + gamma;
+                if denom.abs() > 1e-10 {
+                    let delta = 0.5 * (alpha - gamma) / denom;
+                    (max_bin_idx as f32 + delta) * freq_per_bin
+                } else {
+                    max_bin_idx as f32 * freq_per_bin
+                }
+            } else {
+                max_bin_idx as f32 * freq_per_bin
+            };
+
+        // Band energy
+        let band_energy: f32 = (band_low_bin..=search_high)
+            .map(|bin| buffer[bin].norm_sqr())
+            .sum();
+
+        peak_freqs.push(refined_freq);
+        frame_energies.push(band_energy);
+    }
+
+    let actual_frames = peak_freqs.len();
+    if actual_frames < 2 {
+        return None;
+    }
+
+    // Quick check: reject pure silence (total energy negligible)
+    let total_energy: f32 = frame_energies.iter().sum();
+    if total_energy < 0.01 {
+        return None;
+    }
+
+    // Frame count range for valid chirp durations
+    let min_frames =
+        ((min_duration_secs * sample_rate as f32) / SWEEP_HOP_SIZE as f32).floor() as usize;
+    let max_frames =
+        ((max_duration_secs * sample_rate as f32) / SWEEP_HOP_SIZE as f32).ceil() as usize;
+
+    // Allow small frequency jitter (half a bin)
+    let freq_tolerance = freq_per_bin * 0.5;
+
+    // Scan for the first upward sweep meeting all criteria.
+    // No per-frame energy gating — the monotonic frequency sweep plus
+    // min_sweep_hz criterion is the primary discriminator. This avoids
+    // threshold-tuning issues when the buffer is mostly chirp with no
+    // surrounding silence for noise-floor estimation.
+    let mut i = 0;
+    while i + min_frames <= actual_frames {
+        // Try to extend an upward sweep from here
+        let sweep_start = i;
+        let start_freq = peak_freqs[i];
+        let mut prev_freq = start_freq;
+        let mut sweep_end = i;
+
+        let mut j = i + 1;
+        while j < actual_frames && (j - sweep_start) < max_frames {
+            let freq = peak_freqs[j];
+            // Frequency must not decrease more than half a bin (noise tolerance)
+            if freq < prev_freq - freq_tolerance {
+                break;
+            }
+            prev_freq = freq;
+            sweep_end = j;
+            j += 1;
+        }
+
+        let sweep_len = sweep_end - sweep_start + 1;
+        if sweep_len >= min_frames && sweep_len <= max_frames {
+            let end_freq = peak_freqs[sweep_end];
+            let freq_span = end_freq - start_freq;
+
+            if freq_span >= min_sweep_hz {
+                let duration =
+                    sweep_len as f32 * SWEEP_HOP_SIZE as f32 / sample_rate as f32;
+                let avg_energy = total_energy / actual_frames as f32;
+                return Some(DetectedChirp {
+                    start_freq,
+                    end_freq,
+                    duration_secs: duration,
+                    offset: sweep_start * SWEEP_HOP_SIZE,
+                    energy: avg_energy,
+                });
+            }
+        }
+
+        // Move past this region
+        i = if j > i + 1 { j } else { i + 1 };
+    }
+
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Agent-specific chirp signature (self-echo rejection)
+// ---------------------------------------------------------------------------
+
+/// Agent-specific chirp signature derived from agent name.
+///
+/// Each agent uses unique frequencies and duration to create a distinctive
+/// chirp. On RX, after detecting a chirp with the generic template, the
+/// agent correlates against its own template — if own matches better,
+/// the detection is a self-echo and is discarded.
+#[derive(Debug, Clone)]
+pub struct AgentChirpSignature {
+    /// CALL chirp start frequency (Hz), range 800–1400
+    pub call_start: f32,
+    /// CALL chirp end frequency (Hz), range 2800–3400
+    pub call_end: f32,
+    /// CALL chirp duration (seconds), range 0.12–0.18
+    pub call_duration: f32,
+    /// RESPONSE chirp start frequency (Hz), range 4000–4600
+    pub resp_start: f32,
+    /// RESPONSE chirp end frequency (Hz), range 5800–6400
+    pub resp_end: f32,
+    /// RESPONSE chirp duration (seconds), range 0.12–0.18
+    pub resp_duration: f32,
+}
+
+impl AgentChirpSignature {
+    /// Derive a unique chirp signature from an agent name.
+    ///
+    /// Uses an FNV-1a hash to map the name to specific frequency and duration
+    /// parameters, ensuring different agents produce acoustically distinguishable
+    /// chirps. Non-overlapping bit ranges from the hash feed each parameter.
+    pub fn from_name(name: &str) -> Self {
+        let hash = name_hash(name);
+
+        // Use non-overlapping 5-bit fields (32 values) for frequencies
+        // and 4-bit fields (16 values) for durations.
+        let call_start = 800.0 + ((hash & 0x1F) as f32 / 31.0) * 600.0;
+        let call_end = 2800.0 + (((hash >> 5) & 0x1F) as f32 / 31.0) * 600.0;
+        let call_dur = 0.12 + (((hash >> 10) & 0xF) as f32 / 15.0) * 0.06;
+        let resp_start = 4000.0 + (((hash >> 14) & 0x1F) as f32 / 31.0) * 600.0;
+        let resp_end = 5800.0 + (((hash >> 19) & 0x1F) as f32 / 31.0) * 600.0;
+        let resp_dur = 0.12 + (((hash >> 24) & 0xF) as f32 / 15.0) * 0.06;
+
+        Self {
+            call_start,
+            call_end,
+            call_duration: call_dur,
+            resp_start,
+            resp_end,
+            resp_duration: resp_dur,
+        }
+    }
+
+    /// Generate this agent's CALL chirp at a specific amplitude (for TX).
+    pub fn call_chirp(&self, sample_rate: u32, amplitude: f32) -> Vec<f32> {
+        generate_chirp(self.call_start, self.call_end, self.call_duration, sample_rate, amplitude)
+    }
+
+    /// Generate this agent's RESPONSE chirp at a specific amplitude (for TX).
+    pub fn response_chirp(&self, sample_rate: u32, amplitude: f32) -> Vec<f32> {
+        generate_chirp(self.resp_start, self.resp_end, self.resp_duration, sample_rate, amplitude)
+    }
+
+    /// Bandpass-filtered own CALL template for self-echo detection on RX.
+    pub fn own_call_template(&self, sample_rate: u32) -> Vec<f32> {
+        let chirp = self.call_chirp(sample_rate, CHIRP_AMPLITUDE);
+        bandpass_filter(&chirp, 500.0, 3500.0, sample_rate as f32)
+    }
+
+    /// Bandpass-filtered own RESPONSE template for self-echo detection on RX.
+    pub fn own_response_template(&self, sample_rate: u32) -> Vec<f32> {
+        let chirp = self.response_chirp(sample_rate, CHIRP_AMPLITUDE);
+        bandpass_filter(&chirp, 3500.0, 7000.0, sample_rate as f32)
+    }
+
+    /// Human-readable summary of the signature parameters.
+    pub fn describe(&self) -> String {
+        format!(
+            "CALL {:.0}→{:.0}Hz {:.0}ms, RESP {:.0}→{:.0}Hz {:.0}ms",
+            self.call_start, self.call_end, self.call_duration * 1000.0,
+            self.resp_start, self.resp_end, self.resp_duration * 1000.0,
+        )
+    }
+
+    /// Check if a detected chirp matches this agent's CALL signature.
+    ///
+    /// Used for self-echo rejection: if the detected chirp matches our own
+    /// CALL parameters within tolerance, it's our own echo.
+    pub fn matches_call(&self, detected: &DetectedChirp) -> bool {
+        const FREQ_TOL: f32 = 150.0; // Hz
+        const DUR_TOL: f32 = 0.025;  // 25ms
+
+        (detected.start_freq - self.call_start).abs() < FREQ_TOL
+            && (detected.end_freq - self.call_end).abs() < FREQ_TOL
+            && (detected.duration_secs - self.call_duration).abs() < DUR_TOL
+    }
+
+    /// Check if a detected chirp matches this agent's RESPONSE signature.
+    pub fn matches_response(&self, detected: &DetectedChirp) -> bool {
+        const FREQ_TOL: f32 = 150.0;
+        const DUR_TOL: f32 = 0.025;
+
+        (detected.start_freq - self.resp_start).abs() < FREQ_TOL
+            && (detected.end_freq - self.resp_end).abs() < FREQ_TOL
+            && (detected.duration_secs - self.resp_duration).abs() < DUR_TOL
+    }
+}
+
+/// FNV-1a hash of a string, used for deriving agent chirp parameters.
+fn name_hash(name: &str) -> u32 {
+    let mut hash: u32 = 2166136261;
+    for byte in name.as_bytes() {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    hash
+}
+
+// ---------------------------------------------------------------------------
 // Binary chirp messaging
 // ---------------------------------------------------------------------------
 
@@ -602,6 +925,198 @@ fn bits_to_byte(bits: &[u8]) -> u8 {
         byte |= bit << (7 - i);
     }
     byte
+}
+
+// ---------------------------------------------------------------------------
+// Spectrogram-based binary chirp decoder
+// ---------------------------------------------------------------------------
+
+/// Decode a binary chirp message using spectrogram analysis.
+///
+/// Like `decode_chirp_message` but determines chirp direction (up/down)
+/// by comparing the average peak frequency in the first half vs second
+/// half of each bit slot. This is far more robust through acoustic paths
+/// where distortion and noise break template correlation.
+pub fn decode_chirp_message_sweep(samples: &[f32], sample_rate: u32) -> Option<(u16, u8)> {
+    let chirp_samples = (DATA_CHIRP_DURATION * sample_rate as f32) as usize;
+    let gap_samples = (DATA_CHIRP_GAP * sample_rate as f32) as usize;
+    let slot_samples = chirp_samples + gap_samples;
+
+    let total_bits = 44;
+    let needed = total_bits * slot_samples;
+    if samples.len() < needed / 2 {
+        return None;
+    }
+
+    // Compute the spectrogram: peak frequency per frame in the data chirp band
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(SWEEP_FFT_SIZE);
+
+    let freq_per_bin = sample_rate as f32 / SWEEP_FFT_SIZE as f32;
+    let band_low_bin = (600.0 / freq_per_bin).ceil() as usize;
+    let band_high_bin = (3600.0 / freq_per_bin).floor() as usize;
+    let max_bin = (SWEEP_FFT_SIZE / 2).saturating_sub(1);
+    let search_high = band_high_bin.min(max_bin);
+
+    if band_low_bin >= search_high {
+        return None;
+    }
+
+    let num_frames = samples.len().saturating_sub(SWEEP_FFT_SIZE) / SWEEP_HOP_SIZE + 1;
+    if num_frames < 10 {
+        return None;
+    }
+
+    let hanning: Vec<f32> = (0..SWEEP_FFT_SIZE)
+        .map(|i| 0.5 * (1.0 - (TAU * i as f32 / SWEEP_FFT_SIZE as f32).cos()))
+        .collect();
+
+    let mut peak_freqs = Vec::with_capacity(num_frames);
+    let mut scratch = vec![Complex { re: 0.0f32, im: 0.0 }; fft.get_inplace_scratch_len()];
+
+    for frame_idx in 0..num_frames {
+        let start = frame_idx * SWEEP_HOP_SIZE;
+        if start + SWEEP_FFT_SIZE > samples.len() {
+            break;
+        }
+        let frame = &samples[start..start + SWEEP_FFT_SIZE];
+
+        let mut buffer: Vec<Complex<f32>> = frame
+            .iter()
+            .zip(hanning.iter())
+            .map(|(&s, &w)| Complex { re: s * w, im: 0.0 })
+            .collect();
+
+        fft.process_with_scratch(&mut buffer, &mut scratch);
+
+        let mut max_mag = 0.0f32;
+        let mut max_bin_idx = band_low_bin;
+        for bin in band_low_bin..=search_high {
+            let mag = buffer[bin].norm();
+            if mag > max_mag {
+                max_mag = mag;
+                max_bin_idx = bin;
+            }
+        }
+
+        // Parabolic interpolation
+        let refined_freq =
+            if max_bin_idx > band_low_bin && max_bin_idx < search_high {
+                let alpha = buffer[max_bin_idx - 1].norm();
+                let beta = buffer[max_bin_idx].norm();
+                let gamma = buffer[max_bin_idx + 1].norm();
+                let denom = alpha - 2.0 * beta + gamma;
+                if denom.abs() > 1e-10 {
+                    let delta = 0.5 * (alpha - gamma) / denom;
+                    (max_bin_idx as f32 + delta) * freq_per_bin
+                } else {
+                    max_bin_idx as f32 * freq_per_bin
+                }
+            } else {
+                max_bin_idx as f32 * freq_per_bin
+            };
+
+        peak_freqs.push(refined_freq);
+    }
+
+    let actual_frames = peak_freqs.len();
+
+    // Compute frame boundaries from exact sample positions to avoid
+    // accumulated rounding error (slot_samples may not divide evenly
+    // by SWEEP_HOP_SIZE, causing drift over 44 bit slots).
+    let approx_frames_per_slot = slot_samples / SWEEP_HOP_SIZE;
+    if approx_frames_per_slot < 4 || chirp_samples < SWEEP_HOP_SIZE * 4 {
+        return None;
+    }
+
+    // Search step in frames (roughly 1/4 of a slot)
+    let search_step = (approx_frames_per_slot / 4).max(1);
+    // The last bit slot only needs the chirp portion, not the trailing gap
+    let last_slot_end_sample = (total_bits - 1) * slot_samples + chirp_samples;
+    let min_frames_needed = last_slot_end_sample / SWEEP_HOP_SIZE;
+    let max_search = actual_frames.saturating_sub(min_frames_needed);
+
+    for start_frame in (0..=max_search).step_by(search_step) {
+        if let Some(result) = try_decode_sweep_at_frame(
+            &peak_freqs,
+            start_frame,
+            slot_samples,
+            chirp_samples,
+            total_bits,
+        ) {
+            return Some(result);
+        }
+    }
+
+    None
+}
+
+/// Try to decode a binary chirp message at a specific frame offset.
+///
+/// For each bit slot, compares the average peak frequency in the first
+/// half vs second half of the chirp portion:
+/// - second_avg > first_avg → frequency went up → bit 1
+/// - second_avg < first_avg → frequency went down → bit 0
+///
+/// Uses sample-based slot boundaries converted to frame indices per-slot
+/// to avoid accumulated rounding error from integer frame counts.
+fn try_decode_sweep_at_frame(
+    peak_freqs: &[f32],
+    start_frame: usize,
+    slot_samples: usize,
+    chirp_samples: usize,
+    total_bits: usize,
+) -> Option<(u16, u8)> {
+    let start_sample = start_frame * SWEEP_HOP_SIZE;
+
+    let mut bits = Vec::with_capacity(total_bits);
+
+    for i in 0..total_bits {
+        // Compute exact sample boundaries for this slot
+        let slot_start_sample = start_sample + i * slot_samples;
+        let chirp_mid_sample = slot_start_sample + chirp_samples / 2;
+        let chirp_end_sample = slot_start_sample + chirp_samples;
+
+        // Convert to frame indices
+        let first_start = slot_start_sample / SWEEP_HOP_SIZE;
+        let mid = chirp_mid_sample / SWEEP_HOP_SIZE;
+        let end = chirp_end_sample / SWEEP_HOP_SIZE;
+
+        if end > peak_freqs.len() || mid <= first_start || end <= mid {
+            return None;
+        }
+
+        let first_avg: f32 = peak_freqs[first_start..mid].iter().sum::<f32>()
+            / (mid - first_start) as f32;
+        let second_avg: f32 = peak_freqs[mid..end].iter().sum::<f32>()
+            / (end - mid) as f32;
+
+        bits.push(if second_avg > first_avg { 1u8 } else { 0u8 });
+    }
+
+    // Verify preamble: 10101010
+    if bits[0..8] != PREAMBLE {
+        return None;
+    }
+    // Verify sync: 1111
+    if bits[8..12] != SYNC {
+        return None;
+    }
+
+    // Extract data
+    let data_bits = &bits[12..];
+    let port_hi = bits_to_byte(&data_bits[0..8]);
+    let port_lo = bits_to_byte(&data_bits[8..16]);
+    let caps = bits_to_byte(&data_bits[16..24]);
+    let checksum = bits_to_byte(&data_bits[24..32]);
+
+    let expected_checksum = port_hi ^ port_lo ^ caps;
+    if checksum != expected_checksum {
+        return None;
+    }
+
+    let port = u16::from_be_bytes([port_hi, port_lo]);
+    Some((port, caps))
 }
 
 #[cfg(test)]
@@ -918,5 +1433,335 @@ mod tests {
                 corr
             );
         }
+    }
+
+    // --- Frequency shift tolerance test ---
+
+    #[test]
+    fn test_correlation_vs_frequency_shift() {
+        // Measure how much frequency shift the generic template can tolerate
+        let generic = bandpass_filter(
+            &discovery_chirp(SAMPLE_RATE), 500.0, 3500.0, SAMPLE_RATE as f32,
+        );
+
+        // Shift start freq only (end stays at 3200)
+        println!("\n--- Start freq shift (end=3200) ---");
+        for df in [0, 2, 5, 10, 20, 50, 100, 200, 500] {
+            let shifted = generate_chirp(
+                800.0 + df as f32, 3200.0, CHIRP_DURATION_SECS, SAMPLE_RATE, CHIRP_AMPLITUDE,
+            );
+            let filtered = bandpass_filter(&shifted, 500.0, 3500.0, SAMPLE_RATE as f32);
+            let (corr, _) = detect_chirp(&filtered, &generic);
+            println!("  Δstart={:4}Hz → corr={:.4}", df, corr);
+        }
+
+        // Shift both start and end by same amount
+        println!("--- Both freq shifted equally ---");
+        for df in [0, 2, 5, 10, 20, 50, 100, 200] {
+            let shifted = generate_chirp(
+                800.0 + df as f32, 3200.0 + df as f32,
+                CHIRP_DURATION_SECS, SAMPLE_RATE, CHIRP_AMPLITUDE,
+            );
+            let filtered = bandpass_filter(&shifted, 500.0, 3500.0, SAMPLE_RATE as f32);
+            let (corr, _) = detect_chirp(&filtered, &generic);
+            println!("  Δboth={:4}Hz → corr={:.4}", df, corr);
+        }
+
+        // Duration shift only (same freqs)
+        println!("--- Duration shift (same freqs 800→3200) ---");
+        for dd in [0, 2, 5, 10, 20, 30, 50] {
+            let dur = CHIRP_DURATION_SECS + dd as f32 / 1000.0;
+            let shifted = generate_chirp(800.0, 3200.0, dur, SAMPLE_RATE, CHIRP_AMPLITUDE);
+            let filtered = bandpass_filter(&shifted, 500.0, 3500.0, SAMPLE_RATE as f32);
+            let (corr, _) = detect_chirp(&filtered, &generic);
+            println!("  Δdur={:3}ms → corr={:.4}", dd, corr);
+        }
+    }
+
+    // --- Agent chirp signature tests ---
+
+    #[test]
+    fn test_signature_deterministic() {
+        let sig1 = AgentChirpSignature::from_name("test-agent");
+        let sig2 = AgentChirpSignature::from_name("test-agent");
+        assert_eq!(sig1.call_start, sig2.call_start);
+        assert_eq!(sig1.call_end, sig2.call_end);
+        assert_eq!(sig1.call_duration, sig2.call_duration);
+        assert_eq!(sig1.resp_start, sig2.resp_start);
+        assert_eq!(sig1.resp_end, sig2.resp_end);
+        assert_eq!(sig1.resp_duration, sig2.resp_duration);
+    }
+
+    #[test]
+    fn test_signature_unique_per_name() {
+        let sig1 = AgentChirpSignature::from_name("mumma1");
+        let sig2 = AgentChirpSignature::from_name("mumma2");
+        // At least one CALL parameter should differ
+        let call_differs = sig1.call_start != sig2.call_start
+            || sig1.call_end != sig2.call_end
+            || sig1.call_duration != sig2.call_duration;
+        assert!(call_differs, "mumma1 and mumma2 should have different CALL signatures");
+    }
+
+    #[test]
+    fn test_signature_frequencies_in_range() {
+        for name in &["mumma1", "mumma2", "agent-x", "alice", "bob", "z"] {
+            let sig = AgentChirpSignature::from_name(name);
+            assert!(sig.call_start >= 800.0 && sig.call_start <= 1400.0,
+                "{}: call_start {:.0} out of range", name, sig.call_start);
+            assert!(sig.call_end >= 2800.0 && sig.call_end <= 3400.0,
+                "{}: call_end {:.0} out of range", name, sig.call_end);
+            assert!(sig.call_duration >= 0.12 && sig.call_duration <= 0.18,
+                "{}: call_duration {:.3} out of range", name, sig.call_duration);
+            assert!(sig.resp_start >= 4000.0 && sig.resp_start <= 4600.0,
+                "{}: resp_start {:.0} out of range", name, sig.resp_start);
+            assert!(sig.resp_end >= 5800.0 && sig.resp_end <= 6400.0,
+                "{}: resp_end {:.0} out of range", name, sig.resp_end);
+            assert!(sig.resp_duration >= 0.12 && sig.resp_duration <= 0.18,
+                "{}: resp_duration {:.3} out of range", name, sig.resp_duration);
+        }
+    }
+
+    #[test]
+    fn test_self_echo_discrimination_call() {
+        // Agent's own chirp should correlate better with own template
+        // than with the generic template or another agent's template.
+        let sig1 = AgentChirpSignature::from_name("mumma1");
+        let sig2 = AgentChirpSignature::from_name("mumma2");
+
+        // Agent 1's chirp (as heard through bandpass filter)
+        let chirp1 = sig1.call_chirp(SAMPLE_RATE, CHIRP_AMPLITUDE);
+        let chirp1_bp = bandpass_filter(&chirp1, 500.0, 3500.0, SAMPLE_RATE as f32);
+
+        // Templates
+        let own_tmpl = sig1.own_call_template(SAMPLE_RATE);
+        let other_tmpl = sig2.own_call_template(SAMPLE_RATE);
+        let generic_tmpl = bandpass_filter(
+            &discovery_chirp(SAMPLE_RATE), 500.0, 3500.0, SAMPLE_RATE as f32,
+        );
+
+        // Own template should match own chirp best
+        let (own_corr, _) = detect_chirp(&chirp1_bp, &own_tmpl);
+        let (other_corr, _) = detect_chirp(&chirp1_bp, &other_tmpl);
+        let (generic_corr, _) = detect_chirp(&chirp1_bp, &generic_tmpl);
+
+        assert!(
+            own_corr > generic_corr,
+            "Own template ({:.3}) should match better than generic ({:.3})",
+            own_corr, generic_corr,
+        );
+        assert!(
+            own_corr > other_corr,
+            "Own template ({:.3}) should match better than other agent's ({:.3})",
+            own_corr, other_corr,
+        );
+    }
+
+    #[test]
+    fn test_peer_chirp_detected_by_generic() {
+        // Another agent's chirp should still be detectable by the generic template
+        let sig2 = AgentChirpSignature::from_name("mumma2");
+        let chirp2 = sig2.call_chirp(SAMPLE_RATE, CHIRP_AMPLITUDE);
+        let chirp2_bp = bandpass_filter(&chirp2, 500.0, 3500.0, SAMPLE_RATE as f32);
+
+        let generic_tmpl = bandpass_filter(
+            &discovery_chirp(SAMPLE_RATE), 500.0, 3500.0, SAMPLE_RATE as f32,
+        );
+        let (corr, _) = detect_chirp(&chirp2_bp, &generic_tmpl);
+
+        assert!(
+            corr > DETECTION_THRESHOLD,
+            "Peer chirp should be detected by generic template (corr={:.3}, threshold={})",
+            corr, DETECTION_THRESHOLD,
+        );
+    }
+
+    #[test]
+    fn test_peer_chirp_not_rejected_as_self() {
+        // When agent 1 hears agent 2's chirp, own-template correlation
+        // should be lower than generic, so it's NOT rejected as self-echo.
+        let sig1 = AgentChirpSignature::from_name("mumma1");
+        let sig2 = AgentChirpSignature::from_name("mumma2");
+
+        let chirp2 = sig2.call_chirp(SAMPLE_RATE, CHIRP_AMPLITUDE);
+        let chirp2_bp = bandpass_filter(&chirp2, 500.0, 3500.0, SAMPLE_RATE as f32);
+
+        let own_tmpl = sig1.own_call_template(SAMPLE_RATE);
+        let generic_tmpl = bandpass_filter(
+            &discovery_chirp(SAMPLE_RATE), 500.0, 3500.0, SAMPLE_RATE as f32,
+        );
+
+        let (own_corr, _) = detect_chirp(&chirp2_bp, &own_tmpl);
+        let (generic_corr, _) = detect_chirp(&chirp2_bp, &generic_tmpl);
+
+        assert!(
+            own_corr <= generic_corr,
+            "Peer's chirp should NOT match own template better than generic: own={:.3} generic={:.3}",
+            own_corr, generic_corr,
+        );
+    }
+
+    // --- Spectrogram sweep detector tests ---
+
+    #[test]
+    fn test_sweep_detects_standard_chirp() {
+        let chirp = discovery_call_chirp(SAMPLE_RATE, CHIRP_AMPLITUDE);
+        let result = detect_chirp_sweep(
+            &chirp, 600.0, 3600.0, SAMPLE_RATE, 0.10, 0.20, 500.0,
+        );
+        assert!(result.is_some(), "Should detect standard CALL chirp");
+        let d = result.unwrap();
+        assert!((d.start_freq - 800.0).abs() < 200.0,
+            "Start freq {:.0} should be near 800", d.start_freq);
+        assert!((d.end_freq - 3200.0).abs() < 200.0,
+            "End freq {:.0} should be near 3200", d.end_freq);
+    }
+
+    #[test]
+    fn test_sweep_detects_shifted_chirp() {
+        // A chirp with different frequencies (as an agent would produce)
+        let chirp = generate_chirp(1100.0, 3000.0, 0.14, SAMPLE_RATE, CHIRP_AMPLITUDE);
+        let result = detect_chirp_sweep(
+            &chirp, 600.0, 3600.0, SAMPLE_RATE, 0.10, 0.20, 500.0,
+        );
+        assert!(result.is_some(), "Should detect shifted chirp");
+        let d = result.unwrap();
+        assert!((d.start_freq - 1100.0).abs() < 200.0,
+            "Start freq {:.0} should be near 1100", d.start_freq);
+        assert!((d.end_freq - 3000.0).abs() < 200.0,
+            "End freq {:.0} should be near 3000", d.end_freq);
+    }
+
+    #[test]
+    fn test_sweep_detects_agent_chirps() {
+        // Both agents' chirps should be detected by the sweep detector
+        for name in &["mumma1", "mumma2", "agent-x", "bob"] {
+            let sig = AgentChirpSignature::from_name(name);
+            let chirp = sig.call_chirp(SAMPLE_RATE, CHIRP_AMPLITUDE);
+            let result = detect_chirp_sweep(
+                &chirp, 600.0, 3600.0, SAMPLE_RATE, 0.10, 0.20, 500.0,
+            );
+            assert!(result.is_some(), "{}: sweep detector should find CALL chirp", name);
+        }
+    }
+
+    #[test]
+    fn test_sweep_silence_returns_none() {
+        let silence = vec![0.0f32; SAMPLE_RATE as usize]; // 1 second
+        let result = detect_chirp_sweep(
+            &silence, 600.0, 3600.0, SAMPLE_RATE, 0.10, 0.20, 500.0,
+        );
+        assert!(result.is_none(), "Silence should not trigger sweep detection");
+    }
+
+    #[test]
+    fn test_sweep_self_echo_matching() {
+        let sig1 = AgentChirpSignature::from_name("mumma1");
+        let sig2 = AgentChirpSignature::from_name("mumma2");
+
+        // Agent 1's own chirp should match its own CALL signature
+        let chirp1 = sig1.call_chirp(SAMPLE_RATE, CHIRP_AMPLITUDE);
+        let detected1 = detect_chirp_sweep(
+            &chirp1, 600.0, 3600.0, SAMPLE_RATE, 0.10, 0.20, 500.0,
+        ).expect("Should detect agent1's chirp");
+        assert!(sig1.matches_call(&detected1),
+            "Agent1's chirp should match agent1's CALL signature");
+
+        // Agent 2's chirp should NOT match agent 1's CALL signature
+        let chirp2 = sig2.call_chirp(SAMPLE_RATE, CHIRP_AMPLITUDE);
+        let detected2 = detect_chirp_sweep(
+            &chirp2, 600.0, 3600.0, SAMPLE_RATE, 0.10, 0.20, 500.0,
+        ).expect("Should detect agent2's chirp");
+        assert!(!sig1.matches_call(&detected2),
+            "Agent2's chirp should NOT match agent1's CALL signature (start: {:.0} vs {:.0}, end: {:.0} vs {:.0})",
+            detected2.start_freq, sig1.call_start, detected2.end_freq, sig1.call_end);
+    }
+
+    #[test]
+    fn test_sweep_response_detection() {
+        let sig = AgentChirpSignature::from_name("mumma1");
+        let chirp = sig.response_chirp(SAMPLE_RATE, CHIRP_AMPLITUDE);
+        let result = detect_chirp_sweep(
+            &chirp, 3800.0, 6600.0, SAMPLE_RATE, 0.10, 0.20, 500.0,
+        );
+        assert!(result.is_some(), "Should detect RESPONSE chirp");
+        let d = result.unwrap();
+        assert!(sig.matches_response(&d),
+            "Detected RESPONSE should match own signature");
+    }
+
+    // --- Spectrogram-based binary chirp decoder tests ---
+
+    #[test]
+    fn test_sweep_decode_roundtrip() {
+        let port = 7312u16;
+        let caps = 0x0Bu8;
+        let samples = encode_chirp_message(port, caps, SAMPLE_RATE);
+        assert!(!samples.is_empty());
+
+        let result = decode_chirp_message_sweep(&samples, SAMPLE_RATE);
+        assert_eq!(result, Some((port, caps)), "Sweep decode roundtrip should match");
+    }
+
+    #[test]
+    fn test_sweep_decode_various_ports() {
+        for &(port, caps) in &[(80, 0x01), (9001, 0x0F), (65535, 0xFF), (0, 0x00)] {
+            let samples = encode_chirp_message(port, caps, SAMPLE_RATE);
+            let result = decode_chirp_message_sweep(&samples, SAMPLE_RATE);
+            assert_eq!(
+                result,
+                Some((port, caps)),
+                "Sweep decode failed for port={} caps={}",
+                port,
+                caps
+            );
+        }
+    }
+
+    #[test]
+    fn test_sweep_decode_with_leading_silence() {
+        let port = 7312u16;
+        let caps = 0x0Bu8;
+        let msg = encode_chirp_message(port, caps, SAMPLE_RATE);
+
+        let mut padded = vec![0.0f32; SAMPLE_RATE as usize]; // 1 second of silence
+        padded.extend_from_slice(&msg);
+
+        let result = decode_chirp_message_sweep(&padded, SAMPLE_RATE);
+        assert_eq!(result, Some((port, caps)), "Sweep decode should work with leading silence");
+    }
+
+    #[test]
+    fn test_sweep_decode_with_noise() {
+        let port = 9001u16;
+        let caps = 0x07u8;
+        let samples = encode_chirp_message(port, caps, SAMPLE_RATE);
+
+        let noisy: Vec<f32> = samples
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| {
+                let noise = (i as f32 * 7.3).sin() * 0.05;
+                s + noise
+            })
+            .collect();
+
+        let result = decode_chirp_message_sweep(&noisy, SAMPLE_RATE);
+        assert_eq!(result, Some((port, caps)), "Sweep decode should work with mild noise");
+    }
+
+    #[test]
+    fn test_sweep_with_padding() {
+        let sig = AgentChirpSignature::from_name("mumma1");
+        let chirp = sig.call_chirp(SAMPLE_RATE, CHIRP_AMPLITUDE);
+        // Pad with silence before and after
+        let mut padded = vec![0.0f32; SAMPLE_RATE as usize / 2]; // 0.5s silence
+        padded.extend_from_slice(&chirp);
+        padded.extend(vec![0.0f32; SAMPLE_RATE as usize / 2]);
+
+        let result = detect_chirp_sweep(
+            &padded, 600.0, 3600.0, SAMPLE_RATE, 0.10, 0.20, 500.0,
+        );
+        assert!(result.is_some(), "Should detect chirp in padded signal");
     }
 }

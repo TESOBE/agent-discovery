@@ -88,6 +88,13 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
     // Agents discover and create them collaboratively during the
     // post-handshake exploration protocol.
 
+    // Derive unique chirp signature from agent name
+    let chirp_sig = crate::audio::chirp::AgentChirpSignature::from_name(&config.agent_name);
+    tracing::info!(parent: &agent_span,
+        signature = %chirp_sig.describe(),
+        "Agent chirp signature (unique per name)"
+    );
+
     // Pick TX band from agent name
     let tx_band = band_from_name(&config.agent_name);
     let tx_freqs = &BANDS[tx_band];
@@ -146,8 +153,9 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
             let hs_flag = handshake_done.clone();
             let src_flag = send_response_chirp.clone();
             let chd_flag = chirp_handshake_done.clone();
+            let sig = chirp_sig.clone();
             tokio::spawn(
-                run_announce_loop(mgr, eng, tx_flag, pf_flag, hs_flag, src_flag, chd_flag)
+                run_announce_loop(mgr, eng, tx_flag, pf_flag, hs_flag, src_flag, chd_flag, sig)
                     .instrument(agent_span.clone()),
             );
         }
@@ -160,8 +168,9 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
             let pf_flag = peer_found.clone();
             let src_flag = send_response_chirp.clone();
             let chd_flag = chirp_handshake_done.clone();
+            let sig = chirp_sig.clone();
             tokio::spawn(
-                run_receive_loop(mgr, eng, tx_flag, pf_flag, src_flag, chd_flag)
+                run_receive_loop(mgr, eng, tx_flag, pf_flag, src_flag, chd_flag, sig)
                     .instrument(agent_span.clone()),
             );
         }
@@ -1173,6 +1182,7 @@ async fn run_announce_loop(
     handshake_done: Arc<AtomicBool>,
     send_response_chirp: Arc<AtomicBool>,
     chirp_handshake_done: Arc<AtomicBool>,
+    chirp_sig: crate::audio::chirp::AgentChirpSignature,
 ) {
     use crate::audio::chirp;
 
@@ -1222,22 +1232,22 @@ async fn run_announce_loop(
         let need_response = send_response_chirp.swap(false, Ordering::AcqRel);
 
         let (samples_to_send, total_duration_secs, announce_type) = if need_response {
-            // RESPONSE: send a single chirp at 4000-6400 Hz (answering a call)
-            let response_samples = chirp::discovery_response_chirp(sample_rate, amplitude);
+            // RESPONSE: send agent-specific response chirp (answering a call)
+            let response_samples = chirp_sig.response_chirp(sample_rate, amplitude);
             let duration = response_samples.len() as f32 / sample_rate as f32;
-            (response_samples, duration, "chirp RESPONSE (4-6.4kHz)")
+            (response_samples, duration, "chirp RESPONSE")
         } else if chirp_hs && !sent_confirming_response {
             // Chirp handshake just confirmed by RX — send a confirming RESPONSE
             // chirp back so the peer can also confirm the handshake.
             sent_confirming_response = true;
-            let response_samples = chirp::discovery_response_chirp(sample_rate, amplitude);
+            let response_samples = chirp_sig.response_chirp(sample_rate, amplitude);
             let duration = response_samples.len() as f32 / sample_rate as f32;
-            (response_samples, duration, "chirp CONFIRM-RESPONSE (4-6.4kHz)")
+            (response_samples, duration, "chirp CONFIRM-RESPONSE")
         } else if !chirp_hs {
-            // Stage 1: chirp handshake not done yet — send CALL chirp at 800-3200 Hz
-            let call_samples = chirp::discovery_call_chirp(sample_rate, amplitude);
+            // Stage 1: chirp handshake not done yet — send agent-specific CALL chirp
+            let call_samples = chirp_sig.call_chirp(sample_rate, amplitude);
             let duration = call_samples.len() as f32 / sample_rate as f32;
-            (call_samples, duration, "chirp CALL (0.8-3.2kHz)")
+            (call_samples, duration, "chirp CALL")
         } else {
             // Stage 2: chirp handshake done — send binary chirp message
             let mgr = manager.lock().await;
@@ -1259,7 +1269,7 @@ async fn run_announce_loop(
             );
 
             let binary_msg = chirp::encode_chirp_message(port, caps, sample_rate);
-            let call_samples = chirp::discovery_call_chirp(sample_rate, amplitude);
+            let call_samples = chirp_sig.call_chirp(sample_rate, amplitude);
 
             let mut combined = Vec::with_capacity(
                 call_samples.len() + section_gap.len() + binary_msg.len(),
@@ -1337,13 +1347,17 @@ async fn run_announce_loop(
     }
 }
 
-/// Run the audio receive loop with frequency-separated chirp detection.
+/// Run the audio receive loop with spectrogram-based chirp detection.
 ///
-/// Detection logic (no timing window needed):
-///   1. Check RESPONSE template (4000-6400 Hz) first — if above threshold,
-///      chirp handshake is confirmed immediately.
-///   2. Then check CALL template (800-3200 Hz) — if above threshold,
-///      signal TX to send a response chirp.
+/// Detection uses FFT spectrogram analysis to find upward frequency sweeps,
+/// which works with any agent's unique chirp frequencies. Self-echo rejection
+/// compares detected chirp parameters against the agent's own signature.
+///
+/// Detection logic:
+///   1. Check RESPONSE band (3800-6600 Hz) first — if sweep found and not
+///      self-echo, chirp handshake is confirmed immediately.
+///   2. Then check CALL band (600-3600 Hz) — if sweep found and not
+///      self-echo, signal TX to send a response chirp.
 ///
 /// After chirp handshake, attempts binary chirp message decoding.
 async fn run_receive_loop(
@@ -1353,31 +1367,27 @@ async fn run_receive_loop(
     peer_found: Arc<AtomicBool>,
     send_response_chirp: Arc<AtomicBool>,
     chirp_handshake_done: Arc<AtomicBool>,
+    chirp_sig: crate::audio::chirp::AgentChirpSignature,
 ) {
     use crate::audio::chirp;
 
     let sample_rate = crate::audio::modulator::SAMPLE_RATE;
     let mut sample_buffer = Vec::new();
     let mut peak: f32 = 0.0;
-    let mut peak_corr: f32 = 0.0; // highest chirp correlation in the last stats window
     let mut last_peak_log = std::time::Instant::now();
     let mut decode_attempts: u64 = 0;
     let mut chirp_detections: u64 = 0;
     let mut chirp_msg_decodes: u64 = 0;
 
-    // Pre-generate templates and bandpass-filter them so that the same phase
-    // shifts applied to incoming audio are also in the templates (cancels out
-    // in the correlation, improving detection through acoustic paths).
-    let call_template = chirp::bandpass_filter(
-        &chirp::discovery_chirp(sample_rate), 500.0, 3500.0, sample_rate as f32,
-    );
-    let response_template = chirp::bandpass_filter(
-        &chirp::response_chirp_template(sample_rate), 3500.0, 7000.0, sample_rate as f32,
-    );
-    let chirp_sample_count = call_template.len();
+    // Buffer size: enough to contain the longest possible chirp (180ms) + margin
+    let max_chirp_samples = (0.20 * sample_rate as f32) as usize;
+    // Minimum buffer before attempting detection (shortest chirp 120ms + FFT window)
+    let min_detect_samples = (0.12 * sample_rate as f32) as usize + 512;
 
-    // Adaptive threshold: tracks noise floor, sets threshold to mean + 3*stddev
-    let mut adaptive_threshold = chirp::AdaptiveThreshold::new(300);
+    tracing::info!(
+        signature = %chirp_sig.describe(),
+        "RX: Sweep detector ready (spectrogram-based, frequency-agnostic)"
+    );
 
     // Cooldown: don't re-trigger chirp detection for 200ms after last detection
     let mut last_chirp_detection = std::time::Instant::now() - std::time::Duration::from_secs(10);
@@ -1388,7 +1398,7 @@ async fn run_receive_loop(
     let mut post_tx_cooldown = std::time::Instant::now() - std::time::Duration::from_secs(10);
     let mut was_transmitting = false;
 
-    tracing::info!("RX: Stage 1 — listening for CALL (0.8-3.2kHz) and RESPONSE (4-6.4kHz) chirps...");
+    tracing::info!("RX: Stage 1 — listening for chirp sweeps (CALL 0.6-3.6kHz, RESPONSE 3.8-6.6kHz)...");
 
     loop {
         // Always track peak level from mic, even while transmitting
@@ -1408,11 +1418,9 @@ async fn run_receive_loop(
         // Log audio stats every 10 seconds
         if last_peak_log.elapsed() > std::time::Duration::from_secs(10) {
             let chirp_hs = chirp_handshake_done.load(Ordering::Acquire);
-            let stage = if chirp_hs { "2 (binary chirp)" } else { "1 (chirp)" };
+            let stage = if chirp_hs { "2 (binary chirp)" } else { "1 (sweep)" };
             tracing::info!(
                 peak = format!("{:.4}", peak),
-                peak_corr = format!("{:.4}", peak_corr),
-                threshold = format!("{:.2}", adaptive_threshold.threshold()),
                 buffer = sample_buffer.len(),
                 stage = stage,
                 decodes = decode_attempts,
@@ -1421,7 +1429,6 @@ async fn run_receive_loop(
                 "RX: Audio stats (last 10s)"
             );
             peak = 0.0;
-            peak_corr = 0.0;
             last_peak_log = std::time::Instant::now();
         }
 
@@ -1441,42 +1448,44 @@ async fn run_receive_loop(
             tracing::debug!("RX: Post-TX cooldown started (300ms)");
         }
 
-        // --- Frequency-separated chirp detection (Stage 1 only) ---
+        // --- Spectrogram-based chirp sweep detection (Stage 1 only) ---
         // Once the chirp handshake is done, stop doing CALL/RESPONSE detection
         // so the RX buffer can accumulate the full 5.5s binary chirp message
         // without being interrupted by RESPONSE transmissions.
         let chirp_hs = chirp_handshake_done.load(Ordering::Acquire);
         if !chirp_hs
-            && sample_buffer.len() >= chirp_sample_count
+            && sample_buffer.len() >= min_detect_samples
             && last_chirp_detection.elapsed() > std::time::Duration::from_millis(200)
             && post_tx_cooldown.elapsed() > std::time::Duration::from_millis(300)
         {
-            let threshold = adaptive_threshold.threshold();
+            // 1. Check RESPONSE band first (3800-6600 Hz)
+            if let Some(detected) = chirp::detect_chirp_sweep(
+                &sample_buffer, 3800.0, 6600.0, sample_rate,
+                0.10, 0.20, // min/max duration
+                500.0,      // min sweep span
+            ) {
+                if chirp_sig.matches_response(&detected) {
+                    tracing::info!(
+                        start = format!("{:.0}Hz", detected.start_freq),
+                        end = format!("{:.0}Hz", detected.end_freq),
+                        dur = format!("{:.0}ms", detected.duration_secs * 1000.0),
+                        "RX: RESPONSE matches own signature → self-echo, ignoring"
+                    );
+                    let drain_to = (detected.offset + max_chirp_samples).min(sample_buffer.len());
+                    sample_buffer.drain(..drain_to);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
 
-            // 1. Check RESPONSE template first (4000-6400 Hz)
-            let resp_filtered = chirp::bandpass_filter(&sample_buffer, 3500.0, 7000.0, sample_rate as f32);
-            let (resp_corr, resp_offset) = chirp::detect_chirp_adaptive(&resp_filtered, &response_template, threshold);
-            if resp_corr > peak_corr {
-                peak_corr = resp_corr;
-            }
-            if resp_corr > 0.02 {
-                tracing::debug!(
-                    correlation = format!("{:.4}", resp_corr),
-                    offset = resp_offset,
-                    threshold = format!("{:.4}", threshold),
-                    kind = "RESPONSE",
-                    "RX: Response chirp correlation check"
-                );
-            }
-            if resp_corr > threshold {
                 chirp_detections += 1;
                 last_chirp_detection = std::time::Instant::now();
 
                 tracing::info!(
-                    correlation = format!("{:.3}", resp_corr),
-                    threshold = format!("{:.3}", threshold),
+                    start = format!("{:.0}Hz", detected.start_freq),
+                    end = format!("{:.0}Hz", detected.end_freq),
+                    dur = format!("{:.0}ms", detected.duration_secs * 1000.0),
                     chirps = chirp_detections,
-                    "RX: RESPONSE chirp detected (4-6.4kHz)! Chirp handshake CONFIRMED."
+                    "RX: RESPONSE chirp detected! Chirp handshake CONFIRMED."
                 );
                 chirp_handshake_done.store(true, Ordering::Release);
                 peer_found.store(true, Ordering::Release);
@@ -1486,56 +1495,57 @@ async fn run_receive_loop(
                     tracing::debug!("Could not play chime: {}", e);
                 }
 
-                let drain_to = (resp_offset + chirp_sample_count).min(sample_buffer.len());
+                let drain_to = (detected.offset + max_chirp_samples).min(sample_buffer.len());
                 sample_buffer.drain(..drain_to);
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 continue;
             }
 
-            // 2. Check CALL template (800-3200 Hz)
-            let call_filtered = chirp::bandpass_filter(&sample_buffer, 500.0, 3500.0, sample_rate as f32);
-            let (call_corr, call_offset) = chirp::detect_chirp_adaptive(&call_filtered, &call_template, threshold);
-            if call_corr > peak_corr {
-                peak_corr = call_corr;
-            }
-            if call_corr > 0.02 {
-                tracing::debug!(
-                    correlation = format!("{:.4}", call_corr),
-                    offset = call_offset,
-                    threshold = format!("{:.4}", threshold),
-                    kind = "CALL",
-                    "RX: Call chirp correlation check"
-                );
-            }
-            if call_corr > threshold {
+            // 2. Check CALL band (600-3600 Hz)
+            if let Some(detected) = chirp::detect_chirp_sweep(
+                &sample_buffer, 600.0, 3600.0, sample_rate,
+                0.10, 0.20,
+                500.0,
+            ) {
+                if chirp_sig.matches_call(&detected) {
+                    tracing::info!(
+                        start = format!("{:.0}Hz", detected.start_freq),
+                        end = format!("{:.0}Hz", detected.end_freq),
+                        dur = format!("{:.0}ms", detected.duration_secs * 1000.0),
+                        "RX: CALL matches own signature → self-echo, ignoring"
+                    );
+                    let drain_to = (detected.offset + max_chirp_samples).min(sample_buffer.len());
+                    sample_buffer.drain(..drain_to);
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    continue;
+                }
+
                 chirp_detections += 1;
                 last_chirp_detection = std::time::Instant::now();
 
                 tracing::info!(
-                    correlation = format!("{:.3}", call_corr),
-                    threshold = format!("{:.3}", threshold),
+                    start = format!("{:.0}Hz", detected.start_freq),
+                    end = format!("{:.0}Hz", detected.end_freq),
+                    dur = format!("{:.0}ms", detected.duration_secs * 1000.0),
                     chirps = chirp_detections,
-                    "RX: CALL chirp detected (0.8-3.2kHz). Signaling TX to send RESPONSE."
+                    "RX: CALL chirp detected. Signaling TX to send RESPONSE."
                 );
                 send_response_chirp.store(true, Ordering::Release);
                 peer_found.store(true, Ordering::Release);
 
-                let drain_to = (call_offset + chirp_sample_count).min(sample_buffer.len());
+                let drain_to = (detected.offset + max_chirp_samples).min(sample_buffer.len());
                 sample_buffer.drain(..drain_to);
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 continue;
             }
-
-            // Neither chirp detected — record noise floor for adaptive threshold
-            adaptive_threshold.record(call_corr.max(resp_corr));
         }
 
         // --- Stages 2 & 3: only after chirp handshake ---
         let chirp_hs = chirp_handshake_done.load(Ordering::Acquire);
         if !chirp_hs {
             // Still in stage 1 — only listen for chirps, trim buffer to avoid unbounded growth
-            if sample_buffer.len() > chirp_sample_count * 4 {
-                let excess = sample_buffer.len() - chirp_sample_count * 2;
+            if sample_buffer.len() > max_chirp_samples * 4 {
+                let excess = sample_buffer.len() - max_chirp_samples * 2;
                 sample_buffer.drain(..excess);
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1548,7 +1558,7 @@ async fn run_receive_loop(
         let min_chirp_msg_samples = (sample_rate as f32 * 5.0) as usize;
         if sample_buffer.len() >= min_chirp_msg_samples {
             decode_attempts += 1;
-            if let Some((port, caps)) = chirp::decode_chirp_message(&sample_buffer, sample_rate) {
+            if let Some((port, caps)) = chirp::decode_chirp_message_sweep(&sample_buffer, sample_rate) {
                 chirp_msg_decodes += 1;
                 let address = format!("127.0.0.1:{}", port);
                 let caps_desc = crate::protocol::message::Capabilities(caps).describe();
