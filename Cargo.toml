@@ -1,6 +1,6 @@
 [package]
 name = "agent-discovery"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2021"
 description = "Agent discovery via audio FSK tones"
 
@@ -17,9 +17,11 @@ clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
 anyhow = "1"
 thiserror = "2"
 crossbeam-channel = "0.5"
+socket2 = { version = "0.5", features = ["all"] }
 
 [dev-dependencies]
 tokio-test = "0.4"

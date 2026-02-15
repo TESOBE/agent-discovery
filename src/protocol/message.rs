@@ -77,6 +77,20 @@ impl Capabilities {
     pub fn has_claude(self) -> bool {
         self.0 & Self::CLAUDE_NEGOTIATION != 0
     }
+
+    /// Human-readable description of enabled capabilities.
+    pub fn describe(self) -> String {
+        let mut parts = Vec::new();
+        if self.has_tcp() { parts.push("TCP"); }
+        if self.has_http() { parts.push("HTTP"); }
+        if self.has_obp() { parts.push("OBP"); }
+        if self.has_claude() { parts.push("Claude"); }
+        if parts.is_empty() {
+            "none".to_string()
+        } else {
+            parts.join("+")
+        }
+    }
 }
 
 impl Default for Capabilities {

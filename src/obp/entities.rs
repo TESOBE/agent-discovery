@@ -1,179 +1,147 @@
-/// OBP Dynamic Entity definitions for agent registry and messaging.
+/// OBP Dynamic Entity helpers for agent discovery.
 ///
-/// Uses the v6.0.0 snake_case format with entity_name and example fields.
+/// Entity definitions are NO LONGER created at startup. Instead, agents
+/// discover the management endpoints and create entities collaboratively
+/// during the post-handshake exploration protocol.
 
 use anyhow::Result;
 use serde_json::{json, Value};
 
-use crate::mcp::client::McpClient;
-use crate::obp::client::ObpClient;
+use crate::obp::client::{ObpClient, API_VERSION};
+use crate::obp::exploration::DiscoveredEndpoint;
 
-/// Dynamic entity definition for the agent registry.
-/// Agents register themselves here so others can find them.
-pub fn agent_registry_entity() -> Value {
+/// The entity name used for handshake records.
+pub const HANDSHAKE_ENTITY: &str = "agent_handshake";
+
+/// Dynamic entity definition for recording agent handshakes.
+pub fn agent_handshake_entity() -> Value {
     json!({
-        "entity_name": "AgentRegistryEntry",
-        "example": {
-            "agent_id": "550e8400-e29b-41d4-a716-446655440000",
-            "agent_name": "agent-alpha",
-            "address": "192.168.1.100:9000",
-            "capabilities": 15,
-            "status": "online",
-            "last_seen": "2024-01-01T00:00:00Z",
-            "metadata": "{}"
+        "entity_name": HANDSHAKE_ENTITY,
+        "has_personal_entity": false,
+        "schema": {
+            "description": "Records of agent-to-agent discovery handshakes",
+            "required": ["agent_id", "peer_id"],
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "example": "550e8400-e29b-41d4-a716-446655440000",
+                    "description": "UUID of the agent recording this handshake"
+                },
+                "agent_name": {
+                    "type": "string",
+                    "example": "agent-alpha",
+                    "description": "Human-readable name of the agent"
+                },
+                "peer_id": {
+                    "type": "string",
+                    "example": "660e8400-e29b-41d4-a716-446655440001",
+                    "description": "UUID of the discovered peer"
+                },
+                "peer_address": {
+                    "type": "string",
+                    "example": "192.168.1.42:9000",
+                    "description": "Network address of the peer"
+                },
+                "discovery_method": {
+                    "type": "string",
+                    "example": "audio-chirp",
+                    "description": "How the peer was discovered (audio-chirp, udp, etc.)"
+                },
+                "timestamp": {
+                    "type": "string",
+                    "example": "2024-01-01T00:00:00Z",
+                    "description": "When the handshake occurred (epoch seconds)"
+                }
+            }
         }
     })
 }
 
-/// Dynamic entity definition for agent-to-agent messages.
-/// Agents post messages here for other agents to read.
-pub fn agent_messages_entity() -> Value {
-    json!({
-        "entity_name": "AgentMessage",
-        "example": {
-            "from_agent_id": "550e8400-e29b-41d4-a716-446655440000",
-            "to_agent_id": "660e8400-e29b-41d4-a716-446655440001",
-            "message_type": "negotiation",
-            "payload": "{}",
-            "timestamp": "2024-01-01T00:00:00Z"
+/// Query resource-docs to discover auto-generated CRUD endpoints for a dynamic entity.
+///
+/// Fetches `GET /resource-docs/{API_VERSION}/obp` and filters for entries
+/// whose `request_url` contains `/{entity_name}`.
+pub async fn discover_entity_endpoints_via_http(
+    obp_client: &ObpClient,
+    entity_name: &str,
+) -> Result<Vec<DiscoveredEndpoint>> {
+    let path = format!(
+        "/resource-docs/{}/obp",
+        API_VERSION
+    );
+    tracing::info!("Querying resource-docs for entity '{}' endpoints", entity_name);
+
+    let response = obp_client.get(&path).await?;
+
+    let mut endpoints = Vec::new();
+    let search_fragment = format!("/{}", entity_name);
+
+    if let Some(resource_docs) = response.get("resource_docs").and_then(|r| r.as_array()) {
+        for doc in resource_docs {
+            let request_url = doc.get("request_url").and_then(|u| u.as_str()).unwrap_or("");
+            if request_url.contains(&search_fragment) {
+                let method = doc.get("request_verb").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let operation_id = doc.get("operation_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let summary = doc.get("summary").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                endpoints.push(DiscoveredEndpoint {
+                    method,
+                    path: request_url.to_string(),
+                    operation_id,
+                    summary,
+                });
+            }
         }
-    })
+    }
+
+    tracing::info!(
+        entity = entity_name,
+        count = endpoints.len(),
+        "Discovered {} CRUD endpoints via resource-docs",
+        endpoints.len()
+    );
+    for ep in &endpoints {
+        tracing::info!("  {} {} ({})", ep.method, ep.path, ep.operation_id);
+    }
+
+    Ok(endpoints)
 }
 
-/// Set up dynamic entities on the OBP instance via MCP.
-pub async fn setup_entities_via_mcp(
-    mcp_client: &mut McpClient,
-    bank_id: &str,
-) -> Result<()> {
-    tracing::info!("Setting up OBP dynamic entities via MCP");
-
-    // Create agent registry entity
-    let registry_entity = agent_registry_entity();
-    let result = mcp_client
-        .call_tool(
-            "call_obp_api",
-            json!({
-                "endpoint_id": "OBPv4.0.0-createBankLevelDynamicEntity",
-                "path_params": {"BANK_ID": bank_id},
-                "body": registry_entity
-            }),
-        )
-        .await;
-
-    match result {
-        Ok(val) => tracing::info!("Agent registry entity created: {}", val),
-        Err(e) => tracing::warn!("Agent registry entity setup: {} (may already exist)", e),
-    }
-
-    // Create agent messages entity
-    let messages_entity = agent_messages_entity();
-    let result = mcp_client
-        .call_tool(
-            "call_obp_api",
-            json!({
-                "endpoint_id": "OBPv4.0.0-createBankLevelDynamicEntity",
-                "path_params": {"BANK_ID": bank_id},
-                "body": messages_entity
-            }),
-        )
-        .await;
-
-    match result {
-        Ok(val) => tracing::info!("Agent messages entity created: {}", val),
-        Err(e) => tracing::warn!("Agent messages entity setup: {} (may already exist)", e),
-    }
-
-    Ok(())
-}
-
-/// Set up dynamic entities on the OBP instance via direct HTTP (fallback).
-pub async fn setup_entities_via_http(obp_client: &ObpClient) -> Result<()> {
-    tracing::info!("Setting up OBP dynamic entities via HTTP");
-    let bank_id = obp_client.bank_id();
-
-    let registry_entity = agent_registry_entity();
-    let path = format!("/management/banks/{}/dynamic-entities", bank_id);
-    match obp_client.post(&path, &registry_entity).await {
-        Ok(val) => tracing::info!("Agent registry entity created: {}", val),
-        Err(e) => tracing::warn!("Agent registry entity setup: {} (may already exist)", e),
-    }
-
-    let messages_entity = agent_messages_entity();
-    match obp_client.post(&path, &messages_entity).await {
-        Ok(val) => tracing::info!("Agent messages entity created: {}", val),
-        Err(e) => tracing::warn!("Agent messages entity setup: {} (may already exist)", e),
-    }
-
-    Ok(())
-}
-
-/// Register this agent in the OBP agent registry via MCP.
-pub async fn register_agent_via_mcp(
-    mcp_client: &mut McpClient,
-    bank_id: &str,
+/// Record a handshake event in the OBP agent_handshake entity via direct HTTP.
+pub async fn record_handshake_via_http(
+    obp_client: &ObpClient,
     agent_id: &str,
     agent_name: &str,
-    address: &str,
-    capabilities: u8,
+    peer_id: &str,
+    peer_address: &str,
+    discovery_method: &str,
 ) -> Result<Value> {
+    let bank_id = obp_client.bank_id().to_string();
     let body = json!({
         "agent_id": agent_id,
         "agent_name": agent_name,
-        "address": address,
-        "capabilities": capabilities,
-        "status": "online",
-        "last_seen": chrono_now(),
-        "metadata": "{}"
+        "peer_id": peer_id,
+        "peer_address": peer_address,
+        "discovery_method": discovery_method,
+        "timestamp": iso_now()
     });
 
-    mcp_client
-        .call_tool(
-            "call_obp_api",
-            json!({
-                "endpoint_id": "OBPv4.0.0-createBankLevelDynamicEntity_AgentRegistryEntry",
-                "path_params": {"BANK_ID": bank_id},
-                "body": body
-            }),
-        )
-        .await
+    let path = format!("/banks/{}/{}", bank_id, HANDSHAKE_ENTITY);
+    tracing::info!(
+        agent = agent_name,
+        peer = peer_id,
+        "Recording handshake to OBP: POST {}",
+        path
+    );
+
+    obp_client.post(&path, &body).await
 }
 
-/// Send a message to another agent via OBP dynamic entities.
-pub async fn send_message_via_mcp(
-    mcp_client: &mut McpClient,
-    bank_id: &str,
-    from_agent_id: &str,
-    to_agent_id: &str,
-    message_type: &str,
-    payload: &Value,
-) -> Result<Value> {
-    let body = json!({
-        "from_agent_id": from_agent_id,
-        "to_agent_id": to_agent_id,
-        "message_type": message_type,
-        "payload": serde_json::to_string(payload)?,
-        "timestamp": chrono_now()
-    });
-
-    mcp_client
-        .call_tool(
-            "call_obp_api",
-            json!({
-                "endpoint_id": "OBPv4.0.0-createBankLevelDynamicEntity_AgentMessage",
-                "path_params": {"BANK_ID": bank_id},
-                "body": body
-            }),
-        )
-        .await
-}
-
-/// Simple ISO-8601 timestamp without chrono crate.
-fn chrono_now() -> String {
+/// Simple ISO-8601-ish timestamp without chrono crate.
+pub fn iso_now() -> String {
     use std::time::SystemTime;
     let duration = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     let secs = duration.as_secs();
-    // Simple UTC timestamp (not perfect but avoids chrono dependency)
     format!("{}Z", secs)
 }

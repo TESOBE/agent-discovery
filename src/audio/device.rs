@@ -296,6 +296,96 @@ pub fn test_roundtrip() -> Result<()> {
     Ok(())
 }
 
+/// Play a friendly two-tone chime to signal a successful handshake.
+/// Uses a rising major third (C5 → E5) with a soft envelope.
+pub fn play_handshake_chime() -> Result<()> {
+    let sample_rate = modulator::SAMPLE_RATE;
+    let host = cpal::default_host();
+    let device = host
+        .default_output_device()
+        .context("No output audio device for chime")?;
+
+    let config = cpal::StreamConfig {
+        channels: 1,
+        sample_rate: sample_rate,
+        buffer_size: cpal::BufferSize::Default,
+    };
+
+    // Two notes: C5 (523Hz) for 120ms, then E5 (659Hz) for 150ms
+    let note1_freq = 523.25_f32;
+    let note2_freq = 659.25_f32;
+    let note1_samples = (sample_rate as f32 * 0.12) as usize;
+    let note2_samples = (sample_rate as f32 * 0.15) as usize;
+    let gap_samples = (sample_rate as f32 * 0.03) as usize; // 30ms gap
+    let total = note1_samples + gap_samples + note2_samples;
+
+    let tau = std::f32::consts::TAU;
+    let mut samples = Vec::with_capacity(total);
+
+    // Note 1 with fade-in/fade-out envelope
+    for i in 0..note1_samples {
+        let t = i as f32 / sample_rate as f32;
+        let env = smooth_envelope(i, note1_samples);
+        samples.push((tau * note1_freq * t).sin() * 0.35 * env);
+    }
+    // Silent gap
+    for _ in 0..gap_samples {
+        samples.push(0.0);
+    }
+    // Note 2 with fade-in/fade-out envelope
+    for i in 0..note2_samples {
+        let t = i as f32 / sample_rate as f32;
+        let env = smooth_envelope(i, note2_samples);
+        samples.push((tau * note2_freq * t).sin() * 0.35 * env);
+    }
+
+    let samples = std::sync::Arc::new(samples);
+    let idx = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+    let s = samples.clone();
+    let i = idx.clone();
+    let d = done.clone();
+
+    let stream = device.build_output_stream(
+        &config,
+        move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+            for sample in data.iter_mut() {
+                let cur = i.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if cur < s.len() {
+                    *sample = s[cur];
+                } else {
+                    *sample = 0.0;
+                    d.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        },
+        |err| tracing::error!("Chime output error: {}", err),
+        None,
+    )?;
+
+    stream.play()?;
+    while !done.load(std::sync::atomic::Ordering::Relaxed) {
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+
+    Ok(())
+}
+
+/// Smooth envelope: quick fade-in (10%) and fade-out (20%) to avoid clicks.
+fn smooth_envelope(i: usize, total: usize) -> f32 {
+    let fade_in = (total as f32 * 0.1) as usize;
+    let fade_out = (total as f32 * 0.2) as usize;
+    if i < fade_in {
+        i as f32 / fade_in as f32
+    } else if i > total - fade_out {
+        (total - i) as f32 / fade_out as f32
+    } else {
+        1.0
+    }
+}
+
 /// AudioEngine manages sending and receiving FSK-modulated audio via cpal.
 pub struct AudioEngine {
     tx_sender: Sender<Vec<f32>>,

@@ -180,6 +180,11 @@ impl DiscoveryManager {
     pub fn agent_id(&self) -> Uuid {
         self.config.agent_id
     }
+
+    /// Get the discovery config.
+    pub fn config(&self) -> &DiscoveryConfig {
+        &self.config
+    }
 }
 
 /// Run the discovery announce loop using a loopback engine (for testing).

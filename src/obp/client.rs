@@ -1,15 +1,19 @@
 /// OBP HTTP client with DirectLogin authentication.
 /// Fallback for when MCP server is unavailable.
+///
+/// All requests target the v6.0.0 API exclusively.
 
 use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::config::Config;
 
+/// The only OBP API version we use.
+pub const API_VERSION: &str = "v6.0.0";
+
 /// OBP API client using DirectLogin authentication.
 pub struct ObpClient {
     base_url: String,
-    api_version: String,
     bank_id: String,
     http_client: reqwest::Client,
     auth_token: Option<String>,
@@ -22,7 +26,6 @@ impl ObpClient {
     pub fn new(config: &Config) -> Self {
         Self {
             base_url: config.obp_base_url.clone(),
-            api_version: config.obp_api_version.clone(),
             bank_id: config.obp_bank_id.clone(),
             http_client: reqwest::Client::new(),
             auth_token: None,
@@ -73,7 +76,7 @@ impl ObpClient {
 
     /// Make an authenticated GET request to the OBP API.
     pub async fn get(&self, path: &str) -> Result<Value> {
-        let url = format!("{}/obp/{}{}", self.base_url, self.api_version, path);
+        let url = format!("{}/obp/{}{}", self.base_url, API_VERSION, path);
         let mut request = self.http_client.get(&url);
 
         if let Some(ref token) = self.auth_token {
@@ -93,7 +96,7 @@ impl ObpClient {
 
     /// Make an authenticated POST request to the OBP API.
     pub async fn post(&self, path: &str, body: &Value) -> Result<Value> {
-        let url = format!("{}/obp/{}{}", self.base_url, self.api_version, path);
+        let url = format!("{}/obp/{}{}", self.base_url, API_VERSION, path);
         let mut request = self.http_client.post(&url).json(body);
 
         if let Some(ref token) = self.auth_token {
@@ -113,7 +116,7 @@ impl ObpClient {
 
     /// Make an authenticated PUT request to the OBP API.
     pub async fn put(&self, path: &str, body: &Value) -> Result<Value> {
-        let url = format!("{}/obp/{}{}", self.base_url, self.api_version, path);
+        let url = format!("{}/obp/{}{}", self.base_url, API_VERSION, path);
         let mut request = self.http_client.put(&url).json(body);
 
         if let Some(ref token) = self.auth_token {
@@ -133,7 +136,7 @@ impl ObpClient {
 
     /// Make an authenticated DELETE request to the OBP API.
     pub async fn delete(&self, path: &str) -> Result<Value> {
-        let url = format!("{}/obp/{}{}", self.base_url, self.api_version, path);
+        let url = format!("{}/obp/{}{}", self.base_url, API_VERSION, path);
         let mut request = self.http_client.delete(&url);
 
         if let Some(ref token) = self.auth_token {

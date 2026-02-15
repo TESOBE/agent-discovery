@@ -27,6 +27,13 @@ impl TcpChannel {
         })
     }
 
+    /// Set a read timeout on the underlying stream.
+    pub fn set_read_timeout(&self, duration: Option<std::time::Duration>) -> Result<()> {
+        let stream = self.stream.lock().map_err(|e| anyhow::anyhow!("{}", e))?;
+        stream.set_read_timeout(duration)?;
+        Ok(())
+    }
+
     /// Create from an accepted connection.
     pub fn from_stream(stream: TcpStream) -> Result<Self> {
         let peer_addr = stream
@@ -98,6 +105,44 @@ impl TcpCommListener {
         tracing::info!("TCP listener bound to {}", addr);
 
         Ok(Self { listener })
+    }
+
+    /// Try to bind to `preferred_port`. If it is already in use, try up to
+    /// `max_attempts` consecutive ports before giving up.
+    pub fn bind_with_fallback(preferred_port: u16, max_attempts: u16) -> Result<Self> {
+        for offset in 0..max_attempts {
+            let port = preferred_port.wrapping_add(offset);
+            match Self::bind(port) {
+                Ok(listener) => {
+                    if offset > 0 {
+                        tracing::info!(
+                            preferred = preferred_port,
+                            actual = port,
+                            "Preferred port in use, bound to fallback port"
+                        );
+                    }
+                    return Ok(listener);
+                }
+                Err(e) => {
+                    if offset + 1 < max_attempts {
+                        tracing::debug!(
+                            port,
+                            "Port unavailable, trying next: {}",
+                            e
+                        );
+                    } else {
+                        return Err(e).with_context(|| {
+                            format!(
+                                "Could not bind to any port in range {}..{}",
+                                preferred_port,
+                                preferred_port.wrapping_add(max_attempts)
+                            )
+                        });
+                    }
+                }
+            }
+        }
+        unreachable!()
     }
 
     /// Accept a single connection (blocking).
