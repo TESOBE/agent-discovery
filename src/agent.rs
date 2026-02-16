@@ -136,41 +136,32 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
     let peer_found = Arc::new(AtomicBool::new(false));
     // Set to true after a handshake completes — slows down announce interval
     let handshake_done = Arc::new(AtomicBool::new(false));
-    // Chirp call-and-response flags:
-    // RX sets this when it hears a CALL chirp → TX should send a RESPONSE chirp
-    let send_response_chirp = Arc::new(AtomicBool::new(false));
-    // RX sets this when it hears a RESPONSE chirp → chirp handshake confirmed
-    let chirp_handshake_done = Arc::new(AtomicBool::new(false));
 
     // Start audio loops (skipped with --udp)
     if !udp_only {
-        // Start the announce loop (audio TX — chirp call-and-response + DTMF + FSK)
+        // Start the announce loop (audio TX — says "hello" with binary chirp data)
         if let Some(ref engine) = audio_engine {
             let mgr = discovery_manager.clone();
             let eng = engine.clone();
             let tx_flag = is_transmitting.clone();
             let pf_flag = peer_found.clone();
             let hs_flag = handshake_done.clone();
-            let src_flag = send_response_chirp.clone();
-            let chd_flag = chirp_handshake_done.clone();
             let sig = chirp_sig.clone();
+            let name = agent_name.clone();
             tokio::spawn(
-                run_announce_loop(mgr, eng, tx_flag, pf_flag, hs_flag, src_flag, chd_flag, sig)
+                run_announce_loop(mgr, eng, tx_flag, pf_flag, hs_flag, sig, name)
                     .instrument(agent_span.clone()),
             );
         }
 
-        // Start the receive loop (audio RX — chirp detection + DTMF + FSK)
+        // Start the receive loop (audio RX — listens for "hello" binary chirp data)
         if let Some(ref engine) = audio_engine {
             let mgr = discovery_manager.clone();
             let eng = engine.clone();
             let tx_flag = is_transmitting.clone();
             let pf_flag = peer_found.clone();
-            let src_flag = send_response_chirp.clone();
-            let chd_flag = chirp_handshake_done.clone();
-            let sig = chirp_sig.clone();
             tokio::spawn(
-                run_receive_loop(mgr, eng, tx_flag, pf_flag, src_flag, chd_flag, sig)
+                run_receive_loop(mgr, eng, tx_flag, pf_flag, actual_port)
                     .instrument(agent_span.clone()),
             );
         }
@@ -317,7 +308,7 @@ async fn handle_new_peer(
                     "tcp" => {
                         establish_tcp_channel(
                             agent_id, agent_name, peer,
-                            mcp_client, obp_client, mcp_diagnosis, config,
+                            mcp_client, obp_client, mcp_diagnosis,
                         ).await;
                     }
                     "obp" => {
@@ -340,7 +331,7 @@ async fn handle_new_peer(
         tracing::info!("No Claude API key or peer doesn't support it — trying direct TCP handshake");
         establish_tcp_channel(
             agent_id, agent_name, peer,
-            mcp_client, obp_client, mcp_diagnosis, config,
+            mcp_client, obp_client, mcp_diagnosis,
         ).await;
         negotiated_peers.insert(peer.agent_id);
         handshake_done.store(true, Ordering::Release);
@@ -361,7 +352,6 @@ async fn establish_tcp_channel(
     mcp_client: &Option<Arc<tokio::sync::Mutex<McpClient>>>,
     obp_client: &Option<Arc<ObpClient>>,
     mcp_diagnosis: &Option<Vec<String>>,
-    config: &Config,
 ) {
     let peer_address = peer.address.clone();
     let greeting = serde_json::json!({
@@ -425,7 +415,6 @@ async fn establish_tcp_channel(
     run_obp_exploration_initiator(
         channel,
         &agent_name_owned,
-        &config.obp_bank_id,
         mcp_client,
         obp_client,
         mcp_diagnosis,
@@ -485,7 +474,6 @@ async fn recv_draining_diagnoses(channel: &Arc<TcpChannel>) -> Result<Exploratio
 async fn run_obp_exploration_initiator(
     channel: Arc<TcpChannel>,
     agent_name: &str,
-    bank_id: &str,
     mcp_client: &Option<Arc<tokio::sync::Mutex<McpClient>>>,
     obp_client: &Option<Arc<ObpClient>>,
     mcp_diagnosis: &Option<Vec<String>>,
@@ -495,7 +483,6 @@ async fn run_obp_exploration_initiator(
     // Phase 1: Send ExploreStart, receive ExploreAck
     let start_msg = ExplorationMsg::ExploreStart {
         agent_name: agent_name.to_string(),
-        bank_id: bank_id.to_string(),
     };
     if let Err(e) = send_exploration_msg(&channel, &start_msg).await {
         tracing::error!("Failed to send ExploreStart: {}", e);
@@ -629,7 +616,6 @@ async fn run_obp_exploration_initiator(
                 "call_obp_api",
                 serde_json::json!({
                     "endpoint_id": &endpoint_id,
-                    "path_params": {"BANK_ID": bank_id},
                     "body": &entity_def
                 }),
             )
@@ -643,12 +629,12 @@ async fn run_obp_exploration_initiator(
                 tracing::warn!("MCP entity creation failed: {}. Diagnosing & trying direct HTTP.", e);
                 drop(mcp_guard);
                 diagnose_and_share_mcp_failure(&channel, &e.to_string()).await;
-                create_entity_via_http(obp_client, bank_id, &entity_def, entity_name).await
+                create_entity_via_http(obp_client, &entity_def, entity_name).await
             }
         }
     } else {
         tracing::info!("No MCP client, creating entity via direct HTTP");
-        create_entity_via_http(obp_client, bank_id, &entity_def, entity_name).await
+        create_entity_via_http(obp_client, &entity_def, entity_name).await
     };
 
     let _ = send_exploration_msg(&channel, &ExplorationMsg::EntityCreated {
@@ -662,17 +648,17 @@ async fn run_obp_exploration_initiator(
         _ => {}
     }
 
-    // Phase 5: Discover auto-generated CRUD endpoints
+    // Phase 5: Discover CRUD endpoints via HATEOAS (_links)
     let discovered_endpoints = if let Some(ref obp) = obp_client {
         match entities::discover_entity_endpoints_via_http(obp, entity_name).await {
             Ok(eps) => eps,
             Err(e) => {
-                tracing::warn!("Failed to discover endpoints via resource-docs: {}", e);
+                tracing::warn!("Failed to discover CRUD endpoints via _links: {}", e);
                 Vec::new()
             }
         }
     } else {
-        tracing::warn!("No OBP HTTP client, skipping resource-docs discovery");
+        tracing::warn!("No OBP HTTP client, skipping CRUD endpoint discovery");
         Vec::new()
     };
 
@@ -695,7 +681,7 @@ async fn run_obp_exploration_initiator(
         Err(e) => tracing::warn!("Failed to recv EndpointsConfirmed: {}", e),
     }
 
-    // Phase 6: Create a test record
+    // Phase 6: Create a test record using discovered POST endpoint
     let test_record = serde_json::json!({
         "agent_id": format!("initiator-{}", agent_name),
         "agent_name": agent_name,
@@ -705,16 +691,25 @@ async fn run_obp_exploration_initiator(
         "timestamp": entities::iso_now()
     });
 
+    let create_path = entities::find_create_record_path(&discovered_endpoints);
     let record_result = if let Some(ref obp) = obp_client {
-        let path = format!("/banks/{}/{}", bank_id, entity_name);
-        match obp.post(&path, &test_record).await {
-            Ok(val) => {
-                tracing::info!("Created test record: {}", val);
-                val
+        match create_path {
+            Some(path) => {
+                tracing::info!("Using discovered POST endpoint: {}", path);
+                match obp.post(path, &test_record).await {
+                    Ok(val) => {
+                        tracing::info!("Created test record: {}", val);
+                        val
+                    }
+                    Err(e) => {
+                        tracing::warn!("Failed to create test record: {}", e);
+                        serde_json::json!({"error": format!("{}", e)})
+                    }
+                }
             }
-            Err(e) => {
-                tracing::warn!("Failed to create test record: {}", e);
-                serde_json::json!({"error": format!("{}", e)})
+            None => {
+                tracing::warn!("No POST endpoint discovered for '{}', cannot create record", entity_name);
+                serde_json::json!({"error": "no POST endpoint discovered via _links"})
             }
         }
     } else {
@@ -723,7 +718,7 @@ async fn run_obp_exploration_initiator(
 
     let _ = send_exploration_msg(&channel, &ExplorationMsg::RecordCreated {
         entity_name: entity_name.to_string(),
-        endpoint_used: format!("POST /banks/{}/{}", bank_id, entity_name),
+        endpoint_used: create_path.unwrap_or("none").to_string(),
         record: record_result,
     }).await;
 
@@ -734,8 +729,8 @@ async fn run_obp_exploration_initiator(
 
             let _ = send_exploration_msg(&channel, &ExplorationMsg::ExplorationComplete {
                 summary: format!(
-                    "Successfully discovered and tested dynamic entity '{}' on bank '{}'",
-                    entity_name, bank_id
+                    "Successfully discovered and tested system-level dynamic entity '{}'",
+                    entity_name
                 ),
                 success: matches,
             }).await;
@@ -779,14 +774,12 @@ async fn run_obp_exploration_responder(
     tracing::info!("=== Starting OBP Exploration (responder) ===");
 
     // Expect ExploreStart
-    let bank_id = match recv_exploration_msg(&channel).await {
-        Ok(ExplorationMsg::ExploreStart { agent_name: peer_name, bank_id }) => {
-            tracing::info!("Received ExploreStart from {} for bank {}", peer_name, bank_id);
+    match recv_exploration_msg(&channel).await {
+        Ok(ExplorationMsg::ExploreStart { agent_name: peer_name }) => {
+            tracing::info!("Received ExploreStart from {}", peer_name);
             let _ = send_exploration_msg(&channel, &ExplorationMsg::ExploreAck {
                 agent_name: agent_name.to_string(),
-                bank_id: bank_id.clone(),
             }).await;
-            bank_id
         }
         Ok(other) => {
             tracing::warn!("Expected ExploreStart, got: {:?}", other);
@@ -796,7 +789,7 @@ async fn run_obp_exploration_responder(
             tracing::error!("Failed to receive ExploreStart: {}", e);
             return;
         }
-    };
+    }
 
     // The initiator may send McpDiagnosis before Phase 2 if MCP is down
     let phase2_msg = match recv_exploration_msg(&channel).await {
@@ -883,20 +876,20 @@ async fn run_obp_exploration_responder(
         }
     };
 
-    // Phase 5: Receive DiscoveredCrudEndpoints — independently verify
-    match recv_exploration_msg(&channel).await {
+    // Phase 5: Receive DiscoveredCrudEndpoints — independently verify via _links
+    let responder_endpoints = match recv_exploration_msg(&channel).await {
         Ok(ExplorationMsg::DiscoveredCrudEndpoints { entity_name: ename, endpoints }) => {
             tracing::info!(
                 "Initiator discovered {} CRUD endpoints for '{}'",
                 endpoints.len(), ename
             );
 
-            // Independently verify via resource-docs
+            // Independently verify via _links
             let our_endpoints = if let Some(ref obp) = obp_client {
                 match entities::discover_entity_endpoints_via_http(obp, &ename).await {
                     Ok(eps) => eps,
                     Err(e) => {
-                        tracing::warn!("Responder resource-docs query failed: {}", e);
+                        tracing::warn!("Responder _links query failed: {}", e);
                         Vec::new()
                     }
                 }
@@ -913,8 +906,9 @@ async fn run_obp_exploration_responder(
             let _ = send_exploration_msg(&channel, &ExplorationMsg::EndpointsConfirmed {
                 entity_name: ename,
                 confirmed,
-                our_endpoints,
+                our_endpoints: our_endpoints.clone(),
             }).await;
+            our_endpoints
         }
         Ok(other) => {
             tracing::warn!("Expected DiscoveredCrudEndpoints, got: {:?}", other);
@@ -923,37 +917,45 @@ async fn run_obp_exploration_responder(
                 confirmed: false,
                 our_endpoints: Vec::new(),
             }).await;
+            Vec::new()
         }
         Err(e) => {
             tracing::error!("Failed to receive CRUD endpoints: {}", e);
             return;
         }
-    }
+    };
 
-    // Phase 6: Receive RecordCreated — read it back to verify
+    // Phase 6: Receive RecordCreated — read it back using discovered GET endpoint
     match recv_exploration_msg(&channel).await {
         Ok(ExplorationMsg::RecordCreated { entity_name: ename, record, .. }) => {
             tracing::info!("Initiator created test record for '{}'", ename);
 
-            // Try to read back all records and verify
+            // Try to read back records using the discovered GET endpoint
+            let list_path = entities::find_list_records_path(&responder_endpoints);
             let (read_back, matches) = if let Some(ref obp) = obp_client {
-                let path = format!("/banks/{}/{}", bank_id, ename);
-                match obp.get(&path).await {
-                    Ok(val) => {
-                        tracing::info!("Read back records: {}", val);
-                        // Check if the response contains any records
-                        let has_records = val.get(&format!("{}List", ename))
-                            .or(val.get(&format!("{}_list", ename)))
-                            .and_then(|l| l.as_array())
-                            .map(|arr| !arr.is_empty())
-                            .unwrap_or(false);
-                        // Also just check if response is non-null as a fallback
-                        let matches = has_records || !val.is_null();
-                        (val, matches)
+                match list_path {
+                    Some(path) => {
+                        tracing::info!("Reading back records via discovered GET: {}", path);
+                        match obp.get(path).await {
+                            Ok(val) => {
+                                tracing::info!("Read back records: {}", val);
+                                let has_records = val.get(&format!("{}List", ename))
+                                    .or(val.get(&format!("{}_list", ename)))
+                                    .and_then(|l| l.as_array())
+                                    .map(|arr| !arr.is_empty())
+                                    .unwrap_or(false);
+                                let matches = has_records || !val.is_null();
+                                (val, matches)
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to read back records: {}", e);
+                                (serde_json::json!({"error": format!("{}", e)}), false)
+                            }
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!("Failed to read back records: {}", e);
-                        (serde_json::json!({"error": format!("{}", e)}), false)
+                    None => {
+                        tracing::warn!("No GET endpoint discovered, cannot verify record");
+                        (serde_json::json!({"error": "no GET endpoint discovered"}), false)
                     }
                 }
             } else {
@@ -1033,8 +1035,8 @@ fn find_create_endpoint(content: &str) -> Option<(String, String, String, String
             let path = ep.get("path").and_then(|v| v.as_str()).unwrap_or("");
             let summary = ep.get("summary").and_then(|v| v.as_str()).unwrap_or("");
 
-            // Look for the bank-level create dynamic entity endpoint
-            if (op_id.contains("createBankLevelDynamicEntity") || op_id.contains("Create-Bank-Level-Dynamic-Entity"))
+            // Look for the system-level create dynamic entity endpoint
+            if (op_id.contains("createSystemLevelDynamicEntity") || op_id.contains("Create-System-Level-Dynamic-Entity"))
                 && method.eq_ignore_ascii_case("POST")
             {
                 return Some((
@@ -1068,10 +1070,10 @@ fn find_create_endpoint(content: &str) -> Option<(String, String, String, String
     // If we can't parse as JSON, use known defaults
     tracing::warn!("Could not parse MCP response, using known endpoint ID");
     Some((
-        "OBPv6.0.0-createBankLevelDynamicEntity".to_string(),
+        "OBPv6.0.0-createSystemLevelDynamicEntity".to_string(),
         "POST".to_string(),
-        "/management/banks/BANK_ID/dynamic-entities".to_string(),
-        "Create Bank Level Dynamic Entity".to_string(),
+        "/obp/v6.0.0/management/system-dynamic-entities".to_string(),
+        "Create System Level Dynamic Entity".to_string(),
     ))
 }
 
@@ -1096,21 +1098,20 @@ async fn diagnose_and_share_mcp_failure(channel: &Arc<TcpChannel>, error_msg: &s
     }).await;
 }
 
-/// Return the well-known create-bank-level-dynamic-entity endpoint tuple.
+/// Return the well-known create-system-level-dynamic-entity endpoint tuple.
 /// Used as a fallback when MCP discovery is unavailable.
 fn known_create_endpoint() -> (String, String, String, String) {
     (
-        "OBPv6.0.0-createBankLevelDynamicEntity".to_string(),
+        "OBPv6.0.0-createSystemLevelDynamicEntity".to_string(),
         "POST".to_string(),
-        "/management/banks/BANK_ID/dynamic-entities".to_string(),
-        "Create Bank Level Dynamic Entity".to_string(),
+        "/obp/v6.0.0/management/system-dynamic-entities".to_string(),
+        "Create System Level Dynamic Entity".to_string(),
     )
 }
 
-/// Create a dynamic entity definition via direct HTTP, returning the response.
+/// Create a system-level dynamic entity definition via direct HTTP, returning the response.
 async fn create_entity_via_http(
     obp_client: &Option<Arc<ObpClient>>,
-    bank_id: &str,
     entity_def: &serde_json::Value,
     entity_name: &str,
 ) -> serde_json::Value {
@@ -1118,18 +1119,23 @@ async fn create_entity_via_http(
         tracing::warn!("No OBP HTTP client available to create entity");
         return serde_json::json!({"error": "no OBP client"});
     };
-    let path = format!("/management/banks/{}/dynamic-entities", bank_id);
+    let path = format!("/obp/{}/management/system-dynamic-entities", crate::obp::client::API_VERSION);
     match obp.post(&path, entity_def).await {
         Ok(val) => {
-            tracing::info!("Created entity '{}' via HTTP: {}", entity_name, val);
+            tracing::info!("Created system entity '{}' via HTTP: {}", entity_name, val);
             val
         }
         Err(e) => {
-            tracing::warn!("HTTP entity creation: {} (may already exist)", e);
+            tracing::warn!("HTTP system entity creation: {} (may already exist)", e);
             serde_json::json!({"note": format!("creation returned error (may exist): {}", e)})
         }
     }
 }
+
+/// Back-off parameters for the UDP announce loop.
+const INITIAL_INTERVAL_MS: u64 = 15000;
+const MAX_INTERVAL_MS: u64 = 60000;
+const BACKOFF_MULTIPLIER: f64 = 1.5;
 
 /// Simple xorshift64 PRNG. Not cryptographic, but gives genuinely
 /// different values on each call (unlike reading subsec_nanos in a loop).
@@ -1158,145 +1164,155 @@ impl Rng {
     }
 }
 
-/// Back-off parameters for the announce loop.
-const INITIAL_INTERVAL_MS: u64 = 15000;
-const MAX_INTERVAL_MS: u64 = 60000;
-const BACKOFF_MULTIPLIER: f64 = 1.5;
+/// Derive a fixed second from an agent name using FNV-1a hash.
+/// Returns one of 0, 10, 20, 30, 40, 50 — giving 6 slots per minute,
+/// each 10 seconds apart, so agents never transmit at the same time.
+fn hello_second_from_name(name: &str) -> u32 {
+    let mut hash: u32 = 2166136261;
+    for byte in name.as_bytes() {
+        hash ^= *byte as u32;
+        hash = hash.wrapping_mul(16777619);
+    }
+    (hash % 6) * 10
+}
 
-/// Run the audio announce loop with two-stage chirp protocol.
+/// Run the audio announce loop — says "hello" by broadcasting an agent-specific
+/// chirp signature followed by binary data (port + capabilities).
 ///
-/// **Stage 1 — Chirp call-and-response:**
-///   TX sends a CALL chirp (800-3200 Hz) with progressive volume ramp.
-///   If RX heard a CALL from another agent, it sets `send_response_chirp` →
-///   TX sends a single RESPONSE chirp (4000-6400 Hz).
-///   When RX hears a RESPONSE chirp, it sets `chirp_handshake_done`.
+/// Each broadcast consists of:
+///   [agent-specific CALL chirp] + [gap] + [binary chirp message]
 ///
-/// **Stage 2 — Binary chirp data:**
-///   After the chirp handshake, TX sends a discovery chirp followed by a
-///   binary chirp message (port + capabilities encoded as up/down chirps).
+/// The CALL chirp makes each agent audibly distinctive. The binary data
+/// carries the connection details (port, capabilities) so the peer can
+/// establish a TCP connection immediately upon decoding.
+///
+/// Timing: each agent is assigned a fixed second within the minute (derived
+/// from its name) so that agents never transmit at the same time. Before
+/// contact, the agent transmits every minute at that second. After contact,
+/// it slows to every 10 minutes. After a TCP handshake, every 40 minutes.
 async fn run_announce_loop(
     manager: Arc<tokio::sync::Mutex<DiscoveryManager>>,
     engine: Arc<AudioEngine>,
     is_transmitting: Arc<AtomicBool>,
     peer_found: Arc<AtomicBool>,
     handshake_done: Arc<AtomicBool>,
-    send_response_chirp: Arc<AtomicBool>,
-    chirp_handshake_done: Arc<AtomicBool>,
     chirp_sig: crate::audio::chirp::AgentChirpSignature,
+    agent_name: String,
 ) {
     use crate::audio::chirp;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     let sample_rate = crate::audio::modulator::SAMPLE_RATE;
-    let mut rng = Rng::from_entropy();
+    let section_gap = vec![0.0f32; (sample_rate as f32 * 0.08) as usize]; // 80ms gap
 
-    let section_gap = vec![0.0f32; (sample_rate as f32 * 0.08) as usize]; // 80ms gap between sections
-
-    // Initial random delay (10-20s) so agents started at the same time don't collide
-    let startup_delay = rng.range(10000) + 10000;
+    let my_second = hello_second_from_name(&agent_name);
     tracing::info!(
-        delay_ms = startup_delay,
-        "Announce loop starting after initial delay"
+        second = my_second,
+        "TX: Agent '{}' will say hello at second {} of each minute", agent_name, my_second
     );
-    tokio::time::sleep(std::time::Duration::from_millis(startup_delay)).await;
 
     let mut announce_count: u64 = 0;
-    let mut current_interval_ms: u64 = INITIAL_INTERVAL_MS;
-    // After RX confirms the chirp handshake (by hearing a RESPONSE), we need
-    // to send our own RESPONSE chirp back so the peer can also confirm.
-    // This flag ensures we send a confirming RESPONSE before switching to binary data.
-    let mut sent_confirming_response = false;
+    let mut minutes_between_hellos: u64 = 1; // every minute initially
+    let mut made_contact = false;
 
     loop {
-        announce_count += 1;
+        // Wait until our designated second within the minute
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let current_second = (now_secs % 60) as u32;
+        let wait_secs = if current_second <= my_second {
+            my_second - current_second
+        } else {
+            60 - current_second + my_second
+        };
 
-        // Check if a peer was found - reset back-off
-        if peer_found.swap(false, Ordering::AcqRel) {
-            current_interval_ms = INITIAL_INTERVAL_MS;
-            tracing::info!("TX: Peer found, resetting announce interval");
+        // Also account for minutes_between_hellos: skip minutes if slowing down
+        let total_wait = if announce_count == 0 {
+            // First hello: just wait for our second
+            wait_secs as u64
+        } else {
+            // Wait for (minutes_between_hellos - 1) full minutes + wait_secs
+            (minutes_between_hellos - 1) * 60 + wait_secs as u64
+        };
+
+        if total_wait > 0 {
+            tracing::debug!(
+                wait_s = total_wait,
+                target_second = my_second,
+                "TX: Waiting {}s for next hello slot", total_wait
+            );
+            tokio::time::sleep(std::time::Duration::from_secs(total_wait)).await;
         }
 
-        // After handshake: slow down (interval * 4 + 30s), one-shot
+        announce_count += 1;
+
+        // Check if a peer was found — send a quick reply then slow down
+        if peer_found.swap(false, Ordering::AcqRel) {
+            if !made_contact {
+                made_contact = true;
+                minutes_between_hellos = 10;
+                tracing::info!(
+                    "TX: Heard a peer! Will slow hellos to every {} minutes",
+                    minutes_between_hellos
+                );
+            }
+        }
+
+        // After TCP handshake: slow down even more
         if handshake_done.swap(false, Ordering::AcqRel) {
-            current_interval_ms = current_interval_ms * 4 + 30_000;
+            minutes_between_hellos = 40;
             tracing::info!(
-                interval_s = format!("{:.1}", current_interval_ms as f64 / 1000.0),
-                "TX: Handshake done, slowing down announces"
+                "TX: Handshake done, slowing hellos to every {} minutes",
+                minutes_between_hellos
             );
         }
 
         // Progressive amplitude ramp
         let amplitude = chirp::tx_amplitude(announce_count);
 
-        // Decide what to send based on current stage:
-        let chirp_hs = chirp_handshake_done.load(Ordering::Acquire);
-        let need_response = send_response_chirp.swap(false, Ordering::AcqRel);
+        // Build the "hello" message: signature chirp + binary data
+        let mgr = manager.lock().await;
+        let port = mgr.config().agent_address
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(0);
+        let caps = mgr.config().capabilities.0;
+        drop(mgr);
 
-        let (samples_to_send, total_duration_secs, announce_type) = if need_response {
-            // RESPONSE: send agent-specific response chirp (answering a call)
-            let response_samples = chirp_sig.response_chirp(sample_rate, amplitude);
-            let duration = response_samples.len() as f32 / sample_rate as f32;
-            (response_samples, duration, "chirp RESPONSE")
-        } else if chirp_hs && !sent_confirming_response {
-            // Chirp handshake just confirmed by RX — send a confirming RESPONSE
-            // chirp back so the peer can also confirm the handshake.
-            sent_confirming_response = true;
-            let response_samples = chirp_sig.response_chirp(sample_rate, amplitude);
-            let duration = response_samples.len() as f32 / sample_rate as f32;
-            (response_samples, duration, "chirp CONFIRM-RESPONSE")
-        } else if !chirp_hs {
-            // Stage 1: chirp handshake not done yet — send agent-specific CALL chirp
-            let call_samples = chirp_sig.call_chirp(sample_rate, amplitude);
-            let duration = call_samples.len() as f32 / sample_rate as f32;
-            (call_samples, duration, "chirp CALL")
-        } else {
-            // Stage 2: chirp handshake done — send binary chirp message
-            let mgr = manager.lock().await;
+        let caps_desc = crate::protocol::message::Capabilities(caps).describe();
 
-            let port = mgr.config().agent_address
-                .rsplit(':')
-                .next()
-                .and_then(|p| p.parse::<u16>().ok())
-                .unwrap_or(0);
-            let caps = mgr.config().capabilities.0;
+        let binary_msg = chirp::encode_chirp_message(port, caps, sample_rate);
+        let call_samples = chirp_sig.call_chirp(sample_rate, amplitude);
 
-            let caps_desc = crate::protocol::message::Capabilities(caps).describe();
-            tracing::info!(
-                port,
-                capabilities = caps,
-                caps_desc = %caps_desc,
-                "TX: Encoding binary chirp message: port={} caps=0x{:02X} [{}]",
-                port, caps, caps_desc
-            );
+        let mut samples_to_send = Vec::with_capacity(
+            call_samples.len() + section_gap.len() + binary_msg.len(),
+        );
+        samples_to_send.extend_from_slice(&call_samples);
+        samples_to_send.extend_from_slice(&section_gap);
+        samples_to_send.extend_from_slice(&binary_msg);
 
-            let binary_msg = chirp::encode_chirp_message(port, caps, sample_rate);
-            let call_samples = chirp_sig.call_chirp(sample_rate, amplitude);
-
-            let mut combined = Vec::with_capacity(
-                call_samples.len() + section_gap.len() + binary_msg.len(),
-            );
-            combined.extend_from_slice(&call_samples);
-            combined.extend_from_slice(&section_gap);
-            combined.extend_from_slice(&binary_msg);
-
-            let duration = combined.len() as f32 / sample_rate as f32;
-            (combined, duration, "chirp+binary-data")
-        };
+        let total_duration_secs = samples_to_send.len() as f32 / sample_rate as f32;
 
         tracing::info!(
             announce = announce_count,
-            kind = announce_type,
+            port,
+            caps = %caps_desc,
             amplitude = format!("{:.2}", amplitude),
             duration_ms = format!("{:.0}", total_duration_secs * 1000.0),
-            chirp_hs = chirp_hs,
-            next_interval_s = format!("{:.1}", current_interval_ms as f64 / 1000.0),
-            "TX: Broadcasting {} (amp={:.2})", announce_type, amplitude
+            every_mins = minutes_between_hellos,
+            second = my_second,
+            "TX: Saying hello at second {} (port={} caps=0x{:02X} [{}])",
+            my_second, port, caps, caps_desc
         );
 
         // Mute RX while transmitting so the mic doesn't pick up our own signal
         is_transmitting.store(true, Ordering::Release);
 
         if let Err(e) = engine.send_samples(samples_to_send) {
-            tracing::error!("TX: Failed to send announce: {}", e);
+            tracing::error!("TX: Failed to send hello: {}", e);
         }
 
         // Wait for the tone to finish playing, plus a small margin for echo decay
@@ -1304,70 +1320,23 @@ async fn run_announce_loop(
         tokio::time::sleep(std::time::Duration::from_millis(tx_duration_ms)).await;
 
         is_transmitting.store(false, Ordering::Release);
-
-        // If we just sent a response chirp, use a short interval
-        // so the other agent gets a chance to hear it quickly
-        let sleep_ms = if announce_type.contains("RESPONSE") {
-            500 + rng.range(500)
-        } else {
-            // Add jitter: +/- 25% of current interval
-            let jitter_range = current_interval_ms / 4;
-            let jitter = if jitter_range > 0 { rng.range(jitter_range * 2) } else { 0 };
-            current_interval_ms - jitter_range + jitter
-        };
-
-        tracing::debug!(
-            sleep_ms,
-            "TX: Sleeping before next announce"
-        );
-        // Break sleep into short segments so we can react quickly when
-        // RX detects a CALL chirp and sets send_response_chirp.
-        {
-            let sleep_start = std::time::Instant::now();
-            let target = std::time::Duration::from_millis(sleep_ms);
-            while sleep_start.elapsed() < target {
-                if send_response_chirp.load(Ordering::Acquire) {
-                    tracing::info!("TX: Woke early — send_response_chirp flag is set");
-                    break;
-                }
-                let remaining = target.saturating_sub(sleep_start.elapsed());
-                let chunk = remaining.min(std::time::Duration::from_millis(100));
-                if chunk.is_zero() {
-                    break;
-                }
-                tokio::time::sleep(chunk).await;
-            }
-        }
-
-        // Back off: increase interval for next round (only for regular announces)
-        if !announce_type.contains("RESPONSE") {
-            current_interval_ms = ((current_interval_ms as f64 * BACKOFF_MULTIPLIER) as u64)
-                .min(MAX_INTERVAL_MS);
-        }
     }
 }
 
-/// Run the audio receive loop with spectrogram-based chirp detection.
+/// Run the audio receive loop — listens for "hello" binary chirp data.
 ///
-/// Detection uses FFT spectrogram analysis to find upward frequency sweeps,
-/// which works with any agent's unique chirp frequencies. Self-echo rejection
-/// compares detected chirp parameters against the agent's own signature.
+/// Continuously buffers mic audio and attempts to decode binary chirp
+/// messages. When a message is decoded, the peer's port and capabilities
+/// are extracted and registered with the discovery manager.
 ///
-/// Detection logic:
-///   1. Check RESPONSE band (3800-6600 Hz) first — if sweep found and not
-///      self-echo, chirp handshake is confirmed immediately.
-///   2. Then check CALL band (600-3600 Hz) — if sweep found and not
-///      self-echo, signal TX to send a response chirp.
-///
-/// After chirp handshake, attempts binary chirp message decoding.
+/// Self-echo rejection: if the decoded port matches our own listening port,
+/// the message is our own echo and is discarded.
 async fn run_receive_loop(
     manager: Arc<tokio::sync::Mutex<DiscoveryManager>>,
     engine: Arc<AudioEngine>,
     is_transmitting: Arc<AtomicBool>,
     peer_found: Arc<AtomicBool>,
-    send_response_chirp: Arc<AtomicBool>,
-    chirp_handshake_done: Arc<AtomicBool>,
-    chirp_sig: crate::audio::chirp::AgentChirpSignature,
+    own_port: u16,
 ) {
     use crate::audio::chirp;
 
@@ -1376,32 +1345,22 @@ async fn run_receive_loop(
     let mut peak: f32 = 0.0;
     let mut last_peak_log = std::time::Instant::now();
     let mut decode_attempts: u64 = 0;
-    let mut chirp_detections: u64 = 0;
-    let mut chirp_msg_decodes: u64 = 0;
+    let mut hellos_heard: u64 = 0;
 
-    // Buffer size: enough to contain the longest possible chirp (180ms) + margin
-    let max_chirp_samples = (0.20 * sample_rate as f32) as usize;
-    // Minimum buffer before attempting detection (shortest chirp 120ms + FFT window)
-    let min_detect_samples = (0.12 * sample_rate as f32) as usize + 512;
-
-    tracing::info!(
-        signature = %chirp_sig.describe(),
-        "RX: Sweep detector ready (spectrogram-based, frequency-agnostic)"
-    );
-
-    // Cooldown: don't re-trigger chirp detection for 200ms after last detection
-    let mut last_chirp_detection = std::time::Instant::now() - std::time::Duration::from_secs(10);
-
-    // Post-TX cooldown: suppress chirp detection for 300ms after own TX
-    // finishes, to prevent detecting our own chirp via audio loopback
-    // (e.g. PulseAudio monitor source or close-range speaker→mic echo).
+    // Post-TX cooldown: suppress decoding for 300ms after own TX finishes
     let mut post_tx_cooldown = std::time::Instant::now() - std::time::Duration::from_secs(10);
     let mut was_transmitting = false;
 
-    tracing::info!("RX: Stage 1 — listening for chirp sweeps (CALL 0.6-3.6kHz, RESPONSE 3.8-6.6kHz)...");
+    // Minimum buffer: a binary chirp message is 44 × 100ms ≈ 4.4s
+    let min_msg_samples = (sample_rate as f32 * 4.0) as usize;
+
+    tracing::info!(
+        own_port,
+        "RX: Listening for hello messages (binary chirp data in 1.5-2.5kHz band)"
+    );
 
     loop {
-        // Always track peak level from mic, even while transmitting
+        // Track peak level and buffer samples (only when not transmitting)
         while let Some(chunk) = engine.try_recv_samples() {
             for &s in &chunk {
                 let abs = s.abs();
@@ -1409,7 +1368,6 @@ async fn run_receive_loop(
                     peak = abs;
                 }
             }
-            // Only buffer samples when NOT transmitting
             if !is_transmitting.load(Ordering::Acquire) {
                 sample_buffer.extend_from_slice(&chunk);
             }
@@ -1417,22 +1375,18 @@ async fn run_receive_loop(
 
         // Log audio stats every 10 seconds
         if last_peak_log.elapsed() > std::time::Duration::from_secs(10) {
-            let chirp_hs = chirp_handshake_done.load(Ordering::Acquire);
-            let stage = if chirp_hs { "2 (binary chirp)" } else { "1 (sweep)" };
             tracing::info!(
                 peak = format!("{:.4}", peak),
                 buffer = sample_buffer.len(),
-                stage = stage,
                 decodes = decode_attempts,
-                chirps = chirp_detections,
-                chirp_msgs = chirp_msg_decodes,
+                hellos = hellos_heard,
                 "RX: Audio stats (last 10s)"
             );
             peak = 0.0;
             last_peak_log = std::time::Instant::now();
         }
 
-        // If we're currently transmitting, clear decode buffer and wait
+        // If we're currently transmitting, clear buffer and wait
         let currently_transmitting = is_transmitting.load(Ordering::Acquire);
         if currently_transmitting {
             was_transmitting = true;
@@ -1440,136 +1394,44 @@ async fn run_receive_loop(
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             continue;
         }
-        // Detect the transition from transmitting → not transmitting
+        // Post-TX cooldown: discard samples from the transition period
         if was_transmitting {
             was_transmitting = false;
             post_tx_cooldown = std::time::Instant::now();
-            sample_buffer.clear(); // discard any samples captured during TX transition
-            tracing::debug!("RX: Post-TX cooldown started (300ms)");
+            sample_buffer.clear();
+            tracing::debug!("RX: Post-TX cooldown (300ms)");
         }
 
-        // --- Spectrogram-based chirp sweep detection (Stage 1 only) ---
-        // Once the chirp handshake is done, stop doing CALL/RESPONSE detection
-        // so the RX buffer can accumulate the full 5.5s binary chirp message
-        // without being interrupted by RESPONSE transmissions.
-        let chirp_hs = chirp_handshake_done.load(Ordering::Acquire);
-        if !chirp_hs
-            && sample_buffer.len() >= min_detect_samples
-            && last_chirp_detection.elapsed() > std::time::Duration::from_millis(200)
-            && post_tx_cooldown.elapsed() > std::time::Duration::from_millis(300)
-        {
-            // 1. Check RESPONSE band first (3800-6600 Hz)
-            if let Some(detected) = chirp::detect_chirp_sweep(
-                &sample_buffer, 3800.0, 6600.0, sample_rate,
-                0.10, 0.20, // min/max duration
-                500.0,      // min sweep span
-            ) {
-                if chirp_sig.matches_response(&detected) {
-                    tracing::info!(
-                        start = format!("{:.0}Hz", detected.start_freq),
-                        end = format!("{:.0}Hz", detected.end_freq),
-                        dur = format!("{:.0}ms", detected.duration_secs * 1000.0),
-                        "RX: RESPONSE matches own signature → self-echo, ignoring"
-                    );
-                    let drain_to = (detected.offset + max_chirp_samples).min(sample_buffer.len());
-                    sample_buffer.drain(..drain_to);
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    continue;
-                }
-
-                chirp_detections += 1;
-                last_chirp_detection = std::time::Instant::now();
-
-                tracing::info!(
-                    start = format!("{:.0}Hz", detected.start_freq),
-                    end = format!("{:.0}Hz", detected.end_freq),
-                    dur = format!("{:.0}ms", detected.duration_secs * 1000.0),
-                    chirps = chirp_detections,
-                    "RX: RESPONSE chirp detected! Chirp handshake CONFIRMED."
-                );
-                chirp_handshake_done.store(true, Ordering::Release);
-                peer_found.store(true, Ordering::Release);
-
-                // Play a chime to indicate chirp handshake success
-                if let Err(e) = crate::audio::device::play_handshake_chime() {
-                    tracing::debug!("Could not play chime: {}", e);
-                }
-
-                let drain_to = (detected.offset + max_chirp_samples).min(sample_buffer.len());
-                sample_buffer.drain(..drain_to);
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                continue;
-            }
-
-            // 2. Check CALL band (600-3600 Hz)
-            if let Some(detected) = chirp::detect_chirp_sweep(
-                &sample_buffer, 600.0, 3600.0, sample_rate,
-                0.10, 0.20,
-                500.0,
-            ) {
-                if chirp_sig.matches_call(&detected) {
-                    tracing::info!(
-                        start = format!("{:.0}Hz", detected.start_freq),
-                        end = format!("{:.0}Hz", detected.end_freq),
-                        dur = format!("{:.0}ms", detected.duration_secs * 1000.0),
-                        "RX: CALL matches own signature → self-echo, ignoring"
-                    );
-                    let drain_to = (detected.offset + max_chirp_samples).min(sample_buffer.len());
-                    sample_buffer.drain(..drain_to);
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    continue;
-                }
-
-                chirp_detections += 1;
-                last_chirp_detection = std::time::Instant::now();
-
-                tracing::info!(
-                    start = format!("{:.0}Hz", detected.start_freq),
-                    end = format!("{:.0}Hz", detected.end_freq),
-                    dur = format!("{:.0}ms", detected.duration_secs * 1000.0),
-                    chirps = chirp_detections,
-                    "RX: CALL chirp detected. Signaling TX to send RESPONSE."
-                );
-                send_response_chirp.store(true, Ordering::Release);
-                peer_found.store(true, Ordering::Release);
-
-                let drain_to = (detected.offset + max_chirp_samples).min(sample_buffer.len());
-                sample_buffer.drain(..drain_to);
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                continue;
-            }
-        }
-
-        // --- Stages 2 & 3: only after chirp handshake ---
-        let chirp_hs = chirp_handshake_done.load(Ordering::Acquire);
-        if !chirp_hs {
-            // Still in stage 1 — only listen for chirps, trim buffer to avoid unbounded growth
-            if sample_buffer.len() > max_chirp_samples * 4 {
-                let excess = sample_buffer.len() - max_chirp_samples * 2;
-                sample_buffer.drain(..excess);
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // Don't try decoding during cooldown
+        if post_tx_cooldown.elapsed() < std::time::Duration::from_millis(300) {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             continue;
         }
 
-        // --- Binary chirp message decode (Stage 2) ---
-        // A binary chirp message is 44 bit-slots, each ~100ms = ~4.4 seconds of audio.
-        // We need at least ~4 seconds of buffered audio before attempting a decode.
-        let min_chirp_msg_samples = (sample_rate as f32 * 4.0) as usize;
-        if sample_buffer.len() >= min_chirp_msg_samples {
+        // Try to decode a binary chirp message when we have enough audio
+        if sample_buffer.len() >= min_msg_samples {
             decode_attempts += 1;
             if let Some((port, caps)) = chirp::decode_chirp_message_sweep(&sample_buffer, sample_rate) {
-                chirp_msg_decodes += 1;
+                // Self-echo check: if the decoded port is our own, discard
+                if port == own_port {
+                    tracing::debug!("RX: Decoded own port {} → self-echo, ignoring", port);
+                    sample_buffer.clear();
+                    continue;
+                }
+
+                hellos_heard += 1;
                 let address = format!("127.0.0.1:{}", port);
                 let caps_desc = crate::protocol::message::Capabilities(caps).describe();
                 tracing::info!(
                     port,
                     capabilities = caps,
                     caps_desc = %caps_desc,
-                    "RX: Binary chirp message decoded! Peer at {} — port={} caps=0x{:02X} [{}]",
+                    hellos = hellos_heard,
+                    "RX: Heard hello! Peer at {} — port={} caps=0x{:02X} [{}]",
                     address, port, caps, caps_desc
                 );
 
+                // Register the peer
                 let pseudo_id = {
                     let mut bytes = [0u8; 16];
                     let port_bytes = port.to_be_bytes();
@@ -1586,12 +1448,13 @@ async fn run_receive_loop(
                 );
                 let mut mgr = manager.lock().await;
                 mgr.handle_message(&msg);
+                peer_found.store(true, Ordering::Release);
                 sample_buffer.clear();
                 continue;
             } else {
                 // Trim old samples to avoid unbounded growth
-                let trim = min_chirp_msg_samples / 2;
-                if sample_buffer.len() > min_chirp_msg_samples * 2 {
+                if sample_buffer.len() > min_msg_samples * 2 {
+                    let trim = min_msg_samples / 2;
                     sample_buffer.drain(..trim);
                 }
             }

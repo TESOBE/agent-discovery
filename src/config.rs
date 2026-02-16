@@ -10,7 +10,6 @@ pub struct Config {
     pub obp_username: String,
     pub obp_password: String,
     pub obp_consumer_key: String,
-    pub obp_bank_id: String,
     /// URL of a running MCP server (streamable HTTP transport).
     pub obp_mcp_server_url: Option<String>,
     /// Directory for log files. Defaults to /tmp/agent-discovery.
@@ -37,13 +36,10 @@ impl Config {
                 .unwrap_or_default(),
             claude_model: std::env::var("CLAUDE_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-4-20250514".into()),
-            obp_base_url: std::env::var("OBP_BASE_URL")
-                .unwrap_or_else(|_| "https://apisandbox.openbankproject.com".into()),
+            obp_base_url: std::env::var("OBP_BASE_URL").unwrap_or_default(),
             obp_username: std::env::var("OBP_USERNAME").unwrap_or_default(),
             obp_password: std::env::var("OBP_PASSWORD").unwrap_or_default(),
             obp_consumer_key: std::env::var("OBP_CONSUMER_KEY").unwrap_or_default(),
-            obp_bank_id: std::env::var("OBP_BANK_ID")
-                .unwrap_or_else(|_| "gh.29.uk".into()),
             obp_mcp_server_url: Some(std::env::var("OBP_MCP_SERVER_URL")
                 .unwrap_or_else(|_| "http://0.0.0.0:9100/mcp".into())),
             log_dir: std::env::var("LOG_DIR")

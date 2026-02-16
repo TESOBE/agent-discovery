@@ -23,11 +23,9 @@ pub enum ExplorationMsg {
     // --- Phase 1: Discover management endpoints ---
     ExploreStart {
         agent_name: String,
-        bank_id: String,
     },
     ExploreAck {
         agent_name: String,
-        bank_id: String,
     },
     FoundManagementEndpoint {
         endpoint_id: String,

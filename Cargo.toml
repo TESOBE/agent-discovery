@@ -1,6 +1,6 @@
 [package]
 name = "agent-discovery"
-version = "0.8.0"
+version = "0.12.0"
 edition = "2021"
 description = "Agent discovery via audio FSK tones"
 
