@@ -143,7 +143,7 @@ On a Raspberry Pi you may also need system libraries for audio and TLS:
 
 ```
 sudo apt update
-sudo apt install -y libasound2-dev pkg-config libssl-dev
+sudo apt install -y libasound2-dev pkg-config
 ```
 
 Verify the install:
