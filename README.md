@@ -125,6 +125,36 @@ cargo run -- test-roundtrip        # Play and decode an FSK tone via mic
 
 ## Setup
 
+### Install Rust
+
+Install Rust via [rustup](https://rustup.rs/) (works on Linux, macOS, Windows, and Raspberry Pi):
+
+```
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+Follow the prompts (the defaults are fine), then either restart your shell or run:
+
+```
+source "$HOME/.cargo/env"
+```
+
+On a Raspberry Pi you may also need system libraries for audio and TLS:
+
+```
+sudo apt update
+sudo apt install -y libasound2-dev pkg-config libssl-dev
+```
+
+Verify the install:
+
+```
+rustc --version
+cargo --version
+```
+
+### Configure environment
+
 ```
 cp .env.example .env
 # Edit .env - at minimum set CLAUDE_API_KEY
