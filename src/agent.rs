@@ -553,7 +553,8 @@ async fn run_obp_exploration_initiator(
         known_create_endpoint()
     };
 
-    tracing::info!("Found management endpoint: {} {} ({})", method, path, endpoint_id);
+    let obp_base = obp_client.as_ref().map(|o| o.base_url()).unwrap_or("(no OBP client)");
+    tracing::info!("Found management endpoint: {} {}{} ({})", method, obp_base, path, endpoint_id);
 
     // Share finding with responder
     let _ = send_exploration_msg(&channel, &ExplorationMsg::FoundManagementEndpoint {
@@ -669,7 +670,10 @@ async fn run_obp_exploration_initiator(
         Vec::new()
     };
 
-    tracing::info!("Discovered {} CRUD endpoints for '{}'", discovered_endpoints.len(), entity_name);
+    tracing::info!("Discovered {} CRUD endpoints for '{}':", discovered_endpoints.len(), entity_name);
+    for ep in &discovered_endpoints {
+        tracing::info!("  {} {}{} - {}", ep.method, obp_base, ep.path, ep.summary);
+    }
 
     let _ = send_exploration_msg(&channel, &ExplorationMsg::DiscoveredCrudEndpoints {
         entity_name: entity_name.to_string(),
@@ -702,7 +706,7 @@ async fn run_obp_exploration_initiator(
     let record_result = if let Some(ref obp) = obp_client {
         match create_path {
             Some(path) => {
-                tracing::info!("Using discovered POST endpoint: {}", path);
+                tracing::info!("Using discovered POST endpoint: {}{}", obp.base_url(), path);
                 match obp.post(path, &test_record).await {
                     Ok(val) => {
                         tracing::info!("Created test record: {}", val);
@@ -782,7 +786,10 @@ async fn run_obp_exploration_initiator(
             known_signal_endpoints()
         };
 
-        tracing::info!("Found {} signal endpoints", signal_endpoints.len());
+        tracing::info!("Found {} signal endpoints:", signal_endpoints.len());
+        for ep in &signal_endpoints {
+            tracing::info!("  {} {}{} - {}", ep.method, obp_base, ep.path, ep.summary);
+        }
 
         // Step 2: Share signal endpoints with responder
         if let Err(e) = send_exploration_msg(&channel, &ExplorationMsg::FoundSignalEndpoints {
@@ -938,6 +945,7 @@ async fn run_obp_exploration_responder(
     agent_name: &str,
     obp_client: &Option<Arc<ObpClient>>,
 ) {
+    let obp_base = obp_client.as_ref().map(|o| o.base_url()).unwrap_or("(no OBP client)");
     tracing::info!("=== Starting OBP Exploration (responder) ===");
 
     // Expect ExploreStart
@@ -976,8 +984,8 @@ async fn run_obp_exploration_responder(
     match phase2_msg {
         Ok(ExplorationMsg::FoundManagementEndpoint { endpoint_id, method, path, summary }) => {
             tracing::info!(
-                "Initiator found management endpoint: {} {} ({}) - {}",
-                method, path, endpoint_id, summary
+                "Initiator found management endpoint: {} {}{} ({}) - {}",
+                method, obp_base, path, endpoint_id, summary
             );
             let _ = send_exploration_msg(&channel, &ExplorationMsg::Acknowledged {
                 phase: "management_endpoint".into(),
@@ -1047,9 +1055,12 @@ async fn run_obp_exploration_responder(
     let responder_endpoints = match recv_exploration_msg(&channel).await {
         Ok(ExplorationMsg::DiscoveredCrudEndpoints { entity_name: ename, endpoints }) => {
             tracing::info!(
-                "Initiator discovered {} CRUD endpoints for '{}'",
+                "Initiator discovered {} CRUD endpoints for '{}':",
                 endpoints.len(), ename
             );
+            for ep in &endpoints {
+                tracing::info!("  {} {}{} - {}", ep.method, obp_base, ep.path, ep.summary);
+            }
 
             // Independently verify via _links
             let our_endpoints = if let Some(ref obp) = obp_client {
@@ -1066,8 +1077,15 @@ async fn run_obp_exploration_responder(
 
             let confirmed = !our_endpoints.is_empty() || !endpoints.is_empty();
             tracing::info!(
-                "Responder independently found {} endpoints (confirmed={})",
+                "Responder independently found {} endpoints (confirmed={}):",
                 our_endpoints.len(), confirmed
+            );
+            for ep in &our_endpoints {
+                tracing::info!("  {} {}{} - {}", ep.method, obp_base, ep.path, ep.summary);
+            }
+            tracing::info!(
+                "Responder endpoint verification complete (confirmed={})",
+                confirmed
             );
 
             let _ = send_exploration_msg(&channel, &ExplorationMsg::EndpointsConfirmed {
@@ -1102,7 +1120,7 @@ async fn run_obp_exploration_responder(
             let (read_back, matches) = if let Some(ref obp) = obp_client {
                 match list_path {
                     Some(path) => {
-                        tracing::info!("Reading back records via discovered GET: {}", path);
+                        tracing::info!("Reading back records via discovered GET: {}{}", obp.base_url(), path);
                         match obp.get(path).await {
                             Ok(val) => {
                                 tracing::info!("Read back records: {}", val);
@@ -1156,7 +1174,7 @@ async fn run_obp_exploration_responder(
         Ok(ExplorationMsg::FoundSignalEndpoints { endpoints }) => {
             tracing::info!("=== Phase 7 (responder): Signal channel discovery ({} endpoints) ===", endpoints.len());
             for ep in &endpoints {
-                tracing::info!("  Signal endpoint: {} {} - {}", ep.method, ep.path, ep.summary);
+                tracing::info!("  Signal endpoint: {} {}{} - {}", ep.method, obp_base, ep.path, ep.summary);
             }
             let _ = send_exploration_msg(&channel, &ExplorationMsg::Acknowledged {
                 phase: "signal_endpoints".into(),

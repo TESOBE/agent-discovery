@@ -165,4 +165,8 @@ impl ObpClient {
     pub fn is_authenticated(&self) -> bool {
         self.auth_token.is_some()
     }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
 }
