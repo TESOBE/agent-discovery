@@ -314,6 +314,13 @@ async fn handle_new_peer(
                     "obp" => {
                         tracing::info!("OBP shared storage channel configured");
                     }
+                    "signal" => {
+                        tracing::info!("Signal channel chosen — establishing TCP for exploration, signal channels for ongoing coordination");
+                        establish_tcp_channel(
+                            agent_id, agent_name, peer,
+                            mcp_client, obp_client, mcp_diagnosis,
+                        ).await;
+                    }
                     other => {
                         tracing::warn!("Unknown channel type: {}", other);
                     }
@@ -723,30 +730,14 @@ async fn run_obp_exploration_initiator(
     }).await;
 
     // Wait for responder to verify
-    match recv_exploration_msg(&channel).await {
+    let phase6_success = match recv_exploration_msg(&channel).await {
         Ok(ExplorationMsg::RecordVerified { matches, .. }) => {
             tracing::info!("Responder verified record: matches={}", matches);
-
-            let _ = send_exploration_msg(&channel, &ExplorationMsg::ExplorationComplete {
-                summary: format!(
-                    "Successfully discovered and tested system-level dynamic entity '{}'",
-                    entity_name
-                ),
-                success: matches,
-            }).await;
-
-            if matches {
-                tracing::info!("=== OBP Exploration COMPLETE (success) ===");
-            } else {
-                tracing::warn!("=== OBP Exploration COMPLETE (verification mismatch) ===");
-            }
+            matches
         }
         Ok(other) => {
             tracing::warn!("Expected RecordVerified, got: {:?}", other);
-            let _ = send_exploration_msg(&channel, &ExplorationMsg::ExplorationComplete {
-                summary: "Exploration ended with unexpected response".into(),
-                success: false,
-            }).await;
+            false
         }
         Err(e) => {
             tracing::error!("Failed to recv RecordVerified: {}", e);
@@ -754,7 +745,183 @@ async fn run_obp_exploration_initiator(
                 summary: format!("Exploration ended with error: {}", e),
                 success: false,
             }).await;
+            return;
         }
+    };
+
+    // Phase 7: Signal channel discovery (non-fatal)
+    tracing::info!("=== Phase 7: Signal Channel Discovery ===");
+
+    let signal_ok = 'signal: {
+        // Step 1: Discover signal endpoints via MCP or fallback
+        let signal_endpoints = if let Some(ref mcp) = mcp_client {
+            let mut mcp_guard = mcp.lock().await;
+            match mcp_guard
+                .call_tool(
+                    "list_endpoints_by_tag",
+                    serde_json::json!({"tags": ["Signaling", "Signal", "Channel"]}),
+                )
+                .await
+            {
+                Ok(val) => {
+                    let content = extract_mcp_text_content(&val);
+                    tracing::info!("MCP signal endpoint discovery: {}", &content[..content.len().min(300)]);
+                    // Try to parse endpoints from MCP response
+                    parse_signal_endpoints(&content).unwrap_or_else(|| {
+                        tracing::info!("Could not parse MCP signal response, using known endpoints");
+                        known_signal_endpoints()
+                    })
+                }
+                Err(e) => {
+                    tracing::warn!("MCP signal endpoint discovery failed: {}. Using known endpoints.", e);
+                    known_signal_endpoints()
+                }
+            }
+        } else {
+            tracing::info!("No MCP client, using known signal endpoints");
+            known_signal_endpoints()
+        };
+
+        tracing::info!("Found {} signal endpoints", signal_endpoints.len());
+
+        // Step 2: Share signal endpoints with responder
+        if let Err(e) = send_exploration_msg(&channel, &ExplorationMsg::FoundSignalEndpoints {
+            endpoints: signal_endpoints.clone(),
+        }).await {
+            tracing::warn!("Failed to send FoundSignalEndpoints: {}", e);
+            break 'signal false;
+        }
+
+        // Wait for acknowledgement
+        match recv_exploration_msg(&channel).await {
+            Ok(ExplorationMsg::Acknowledged { phase }) => {
+                tracing::info!("Responder acknowledged signal phase: {}", phase);
+            }
+            Ok(other) => tracing::debug!("Expected Acknowledged for signal, got: {:?}", other),
+            Err(e) => {
+                tracing::warn!("Failed to recv signal ack: {}", e);
+                break 'signal false;
+            }
+        }
+
+        // Step 3: Publish a test message to the agent-discovery channel
+        let test_channel = "agent-discovery";
+        let test_payload = serde_json::json!({
+            "payload": {
+                "from": agent_name,
+                "type": "exploration-test",
+                "timestamp": entities::iso_now(),
+                "message": format!("Signal channel test from {}", agent_name)
+            }
+        });
+
+        let publish_result = if let Some(ref mcp) = mcp_client {
+            let mut mcp_guard = mcp.lock().await;
+            match mcp_guard
+                .call_tool(
+                    "call_obp_api",
+                    serde_json::json!({
+                        "endpoint_id": "OBPv6.0.0-publishSignalMessage",
+                        "path_params": {"CHANNEL_NAME": test_channel},
+                        "body": &test_payload,
+                    }),
+                )
+                .await
+            {
+                Ok(val) => {
+                    let text = extract_mcp_text_content(&val);
+                    tracing::info!("Published signal message via MCP: {}", text);
+                    serde_json::from_str::<serde_json::Value>(&text).ok()
+                }
+                Err(e) => {
+                    tracing::warn!("MCP signal publish failed: {}. Trying direct HTTP.", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        // Fallback to direct HTTP if MCP failed
+        let publish_result = match publish_result {
+            Some(val) => val,
+            None => {
+                if let Some(ref obp) = obp_client {
+                    match publish_signal_message_via_http(obp, test_channel, &test_payload).await {
+                        Ok(val) => {
+                            tracing::info!("Published signal message via HTTP: {}", val);
+                            val
+                        }
+                        Err(e) => {
+                            tracing::warn!("Signal channel publish via HTTP failed: {}", e);
+                            break 'signal false;
+                        }
+                    }
+                } else {
+                    tracing::warn!("No OBP client available for signal channel test");
+                    break 'signal false;
+                }
+            }
+        };
+
+        let message_id = publish_result
+            .get("message_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+
+        tracing::info!("Signal test message published: id={}", message_id);
+
+        // Step 4: Tell responder about the test
+        if let Err(e) = send_exploration_msg(&channel, &ExplorationMsg::SignalChannelTested {
+            channel_name: test_channel.to_string(),
+            message_id: message_id.clone(),
+            payload: test_payload.clone(),
+        }).await {
+            tracing::warn!("Failed to send SignalChannelTested: {}", e);
+            break 'signal false;
+        }
+
+        // Step 5: Wait for responder's verification
+        match recv_exploration_msg(&channel).await {
+            Ok(ExplorationMsg::SignalChannelVerified { channel_name, verified }) => {
+                tracing::info!(
+                    "Signal channel '{}' verification: {}",
+                    channel_name,
+                    if verified { "SUCCESS" } else { "FAILED" }
+                );
+                verified
+            }
+            Ok(other) => {
+                tracing::warn!("Expected SignalChannelVerified, got: {:?}", other);
+                false
+            }
+            Err(e) => {
+                tracing::warn!("Failed to recv SignalChannelVerified: {}", e);
+                false
+            }
+        }
+    };
+
+    if signal_ok {
+        tracing::info!("=== Phase 7: Signal channels verified ===");
+    } else {
+        tracing::warn!("=== Phase 7: Signal channels not available (non-fatal) ===");
+    }
+
+    // Send ExplorationComplete (success based on Phase 6 result)
+    let _ = send_exploration_msg(&channel, &ExplorationMsg::ExplorationComplete {
+        summary: format!(
+            "Explored dynamic entity '{}' (phase6={}) and signal channels (phase7={})",
+            entity_name, phase6_success, signal_ok
+        ),
+        success: phase6_success,
+    }).await;
+
+    if phase6_success {
+        tracing::info!("=== OBP Exploration COMPLETE (success) ===");
+    } else {
+        tracing::warn!("=== OBP Exploration COMPLETE (verification mismatch) ===");
     }
 }
 
@@ -983,16 +1150,95 @@ async fn run_obp_exploration_responder(
         }
     }
 
-    // Wait for ExplorationComplete
+    // Phase 7: Signal channel discovery and verification (responder side)
+    // The next message may be FoundSignalEndpoints (Phase 7) or ExplorationComplete (no Phase 7)
     match recv_exploration_msg(&channel).await {
-        Ok(ExplorationMsg::ExplorationComplete { summary, success }) => {
-            if success {
-                tracing::info!("=== OBP Exploration COMPLETE (responder): {} ===", summary);
-            } else {
-                tracing::warn!("=== OBP Exploration ended (responder): {} ===", summary);
+        Ok(ExplorationMsg::FoundSignalEndpoints { endpoints }) => {
+            tracing::info!("=== Phase 7 (responder): Signal channel discovery ({} endpoints) ===", endpoints.len());
+            for ep in &endpoints {
+                tracing::info!("  Signal endpoint: {} {} - {}", ep.method, ep.path, ep.summary);
+            }
+            let _ = send_exploration_msg(&channel, &ExplorationMsg::Acknowledged {
+                phase: "signal_endpoints".into(),
+            }).await;
+
+            // Receive SignalChannelTested — then verify by reading the channel
+            match recv_exploration_msg(&channel).await {
+                Ok(ExplorationMsg::SignalChannelTested { channel_name, message_id, payload: _ }) => {
+                    tracing::info!(
+                        "Initiator tested signal channel '{}' with message_id={}",
+                        channel_name, message_id
+                    );
+
+                    // Try to read back the message from the signal channel
+                    let verified = if let Some(ref obp) = obp_client {
+                        match read_signal_messages_via_http(obp, &channel_name).await {
+                            Ok(val) => {
+                                tracing::info!("Signal channel '{}' messages: {}", channel_name, val);
+                                // Check if our test message is in the response
+                                let found = if let Some(messages) = val.get("messages").and_then(|m| m.as_array()) {
+                                    messages.iter().any(|m| {
+                                        m.get("message_id")
+                                            .and_then(|id| id.as_str())
+                                            .map(|id| id == message_id)
+                                            .unwrap_or(false)
+                                    })
+                                } else {
+                                    // If we got any response at all, the channel exists
+                                    !val.is_null()
+                                };
+                                found
+                            }
+                            Err(e) => {
+                                tracing::warn!("Failed to read signal channel '{}': {}", channel_name, e);
+                                false
+                            }
+                        }
+                    } else {
+                        tracing::warn!("No OBP client to verify signal channel");
+                        false
+                    };
+
+                    tracing::info!("Signal channel '{}' verified: {}", channel_name, verified);
+                    let _ = send_exploration_msg(&channel, &ExplorationMsg::SignalChannelVerified {
+                        channel_name,
+                        verified,
+                    }).await;
+                }
+                Ok(other) => {
+                    tracing::warn!("Expected SignalChannelTested, got: {:?}", other);
+                    let _ = send_exploration_msg(&channel, &ExplorationMsg::SignalChannelVerified {
+                        channel_name: "unknown".into(),
+                        verified: false,
+                    }).await;
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to receive SignalChannelTested: {}", e);
+                }
+            }
+
+            // Now wait for ExplorationComplete
+            match recv_exploration_msg(&channel).await {
+                Ok(ExplorationMsg::ExplorationComplete { summary, success }) => {
+                    if success {
+                        tracing::info!("=== OBP Exploration COMPLETE (responder): {} ===", summary);
+                    } else {
+                        tracing::warn!("=== OBP Exploration ended (responder): {} ===", summary);
+                    }
+                }
+                Ok(other) => tracing::debug!("Expected ExplorationComplete, got: {:?}", other),
+                Err(e) => tracing::debug!("Connection closed after exploration: {}", e),
             }
         }
-        Ok(other) => tracing::debug!("Expected ExplorationComplete, got: {:?}", other),
+        Ok(ExplorationMsg::ExplorationComplete { summary, success }) => {
+            // No Phase 7 — initiator went straight to complete
+            if success {
+                tracing::info!("=== OBP Exploration COMPLETE (responder, no signal phase): {} ===", summary);
+            } else {
+                tracing::warn!("=== OBP Exploration ended (responder, no signal phase): {} ===", summary);
+            }
+        }
+        Ok(other) => tracing::debug!("Expected FoundSignalEndpoints or ExplorationComplete, got: {:?}", other),
         Err(e) => tracing::debug!("Connection closed after exploration: {}", e),
     }
 }
@@ -1013,6 +1259,49 @@ fn extract_mcp_text_content(val: &serde_json::Value) -> String {
     }
     // Fallback: just stringify the whole thing
     val.to_string()
+}
+
+/// Parse the MCP list_endpoints_by_tag response to extract signal channel endpoints.
+fn parse_signal_endpoints(content: &str) -> Option<Vec<crate::obp::exploration::DiscoveredEndpoint>> {
+    use crate::obp::exploration::DiscoveredEndpoint;
+    let val = serde_json::from_str::<serde_json::Value>(content).ok()?;
+
+    let raw_endpoints = if val.is_array() {
+        val.as_array().cloned().unwrap_or_default()
+    } else if let Some(arr) = val.get("endpoints").and_then(|e| e.as_array()) {
+        arr.clone()
+    } else {
+        vec![val]
+    };
+
+    let mut result = Vec::new();
+    for ep in &raw_endpoints {
+        let op_id = ep.get("operation_id").or(ep.get("id"))
+            .and_then(|v| v.as_str()).unwrap_or("");
+        let method = ep.get("method").and_then(|v| v.as_str()).unwrap_or("");
+        let path = ep.get("path").and_then(|v| v.as_str()).unwrap_or("");
+        let summary = ep.get("summary").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Filter for signal-related endpoints
+        let is_signal = op_id.to_lowercase().contains("signal")
+            || path.to_lowercase().contains("signal")
+            || summary.to_lowercase().contains("signal");
+
+        if is_signal && !op_id.is_empty() {
+            result.push(DiscoveredEndpoint {
+                method: method.to_string(),
+                path: path.to_string(),
+                operation_id: op_id.to_string(),
+                summary: summary.to_string(),
+            });
+        }
+    }
+
+    if result.is_empty() {
+        None
+    } else {
+        Some(result)
+    }
 }
 
 /// Parse the MCP list_endpoints_by_tag response to find the create dynamic entity endpoint.
@@ -1130,6 +1419,71 @@ async fn create_entity_via_http(
             serde_json::json!({"note": format!("creation returned error (may exist): {}", e)})
         }
     }
+}
+
+/// Return hardcoded signal channel endpoint descriptions as a fallback
+/// when MCP discovery is unavailable.
+fn known_signal_endpoints() -> Vec<crate::obp::exploration::DiscoveredEndpoint> {
+    use crate::obp::exploration::DiscoveredEndpoint;
+    vec![
+        DiscoveredEndpoint {
+            method: "GET".into(),
+            path: format!("/obp/{}/signal/channels", crate::obp::client::API_VERSION),
+            operation_id: "OBPv6.0.0-getSignalChannels".into(),
+            summary: "Get Signal Channels".into(),
+        },
+        DiscoveredEndpoint {
+            method: "POST".into(),
+            path: format!("/obp/{}/signal/channels/CHANNEL_NAME/messages", crate::obp::client::API_VERSION),
+            operation_id: "OBPv6.0.0-publishSignalMessage".into(),
+            summary: "Publish Signal Message".into(),
+        },
+        DiscoveredEndpoint {
+            method: "GET".into(),
+            path: format!("/obp/{}/signal/channels/CHANNEL_NAME/messages", crate::obp::client::API_VERSION),
+            operation_id: "OBPv6.0.0-getSignalMessages".into(),
+            summary: "Get Signal Messages".into(),
+        },
+        DiscoveredEndpoint {
+            method: "GET".into(),
+            path: format!("/obp/{}/signal/channels/CHANNEL_NAME/info", crate::obp::client::API_VERSION),
+            operation_id: "OBPv6.0.0-getSignalChannelInfo".into(),
+            summary: "Get Signal Channel Info".into(),
+        },
+        DiscoveredEndpoint {
+            method: "DELETE".into(),
+            path: format!("/obp/{}/signal/channels/CHANNEL_NAME", crate::obp::client::API_VERSION),
+            operation_id: "OBPv6.0.0-deleteSignalChannel".into(),
+            summary: "Delete Signal Channel".into(),
+        },
+    ]
+}
+
+/// Publish a test message to an OBP signal channel via direct HTTP POST.
+async fn publish_signal_message_via_http(
+    obp: &ObpClient,
+    channel_name: &str,
+    payload: &serde_json::Value,
+) -> Result<serde_json::Value> {
+    let path = format!(
+        "/obp/{}/signal/channels/{}/messages",
+        crate::obp::client::API_VERSION,
+        channel_name
+    );
+    obp.post(&path, payload).await
+}
+
+/// Read messages from an OBP signal channel via direct HTTP GET.
+async fn read_signal_messages_via_http(
+    obp: &ObpClient,
+    channel_name: &str,
+) -> Result<serde_json::Value> {
+    let path = format!(
+        "/obp/{}/signal/channels/{}/messages",
+        crate::obp::client::API_VERSION,
+        channel_name
+    );
+    obp.get(&path).await
 }
 
 /// Back-off parameters for the UDP announce loop.

@@ -3,6 +3,9 @@
 /// Two agents collaboratively discover how OBP dynamic entities work,
 /// starting from zero: find management endpoints, learn the schema,
 /// create an entity, discover auto-generated CRUD, and test it.
+///
+/// Phase 7 extends the protocol to discover and verify OBP signal channels
+/// for ephemeral agent-to-agent messaging.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -68,6 +71,20 @@ pub enum ExplorationMsg {
         entity_name: String,
         record: Value,
         matches: bool,
+    },
+
+    // --- Phase 7: Signal channel discovery and verification ---
+    FoundSignalEndpoints {
+        endpoints: Vec<DiscoveredEndpoint>,
+    },
+    SignalChannelTested {
+        channel_name: String,
+        message_id: String,
+        payload: Value,
+    },
+    SignalChannelVerified {
+        channel_name: String,
+        verified: bool,
     },
 
     // --- Diagnostics ---

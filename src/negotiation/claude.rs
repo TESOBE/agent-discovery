@@ -110,8 +110,17 @@ Available capabilities:
 - OBP (bit 2): Open Bank Project API for shared storage via dynamic entities
 - Claude (bit 3): Both agents support Claude-mediated negotiation
 
-Prefer TCP for low-latency direct communication when both support it.
-Use OBP dynamic entities as a shared bulletin board when direct connection isn't possible.
+OBP Signal Channels:
+OBP provides Redis-backed signal channels for ephemeral agent messaging at /obp/v6.0.0/signal/channels.
+- Channels auto-create on first publish, messages expire after 1 hour
+- POST .../signal/channels/CHANNEL_NAME/messages to publish (payload field accepts any JSON)
+- GET .../signal/channels/CHANNEL_NAME/messages to read (offset/limit pagination)
+- Supports broadcast messages and private messages (via to_user_id)
+- No database writes — ideal for cross-network agent coordination
+
+Prefer TCP/IP for low-latency direct communication when both agents are on the same network.
+Use OBP signal channels for cross-network coordination when direct TCP/IP isn't possible.
+Use OBP dynamic entities for persistent shared data.
 "#,
             our_agent_id = our_agent_id,
             our_address = our_address,
