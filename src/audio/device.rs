@@ -421,23 +421,29 @@ impl AudioEngine {
         tracing::info!("Output default config: {:?}", out_default);
         tracing::info!("Input default config: {:?}", in_default);
 
+        // Use each device's native channel count and sample rate to avoid
+        // ALSA errors on USB devices that don't support mono or 44100Hz.
+        // Our modulator generates at 44100Hz; if the device runs at a
+        // different rate, the chirp frequencies will shift proportionally,
+        // but both TX and RX use the same rate so detection still works
+        // between agents on the same hardware.
         let out_channels = out_default.channels();
         let in_channels = in_default.channels();
+        let out_rate = out_default.sample_rate();
+        let in_rate = in_default.sample_rate();
 
-        // Use each device's native channel count to avoid ALSA errors on
-        // devices that only support stereo (common on USB audio on Pi).
         let out_config = cpal::StreamConfig {
             channels: out_channels,
-            sample_rate: modulator::SAMPLE_RATE,
+            sample_rate: out_rate,
             buffer_size: cpal::BufferSize::Default,
         };
         let in_config = cpal::StreamConfig {
             channels: in_channels,
-            sample_rate: modulator::SAMPLE_RATE,
+            sample_rate: in_rate,
             buffer_size: cpal::BufferSize::Default,
         };
-        tracing::info!("Output stream: {}ch @ {}Hz", out_channels, modulator::SAMPLE_RATE);
-        tracing::info!("Input stream: {}ch @ {}Hz", in_channels, modulator::SAMPLE_RATE);
+        tracing::info!("Output stream: {}ch @ {}Hz", out_channels, out_rate);
+        tracing::info!("Input stream: {}ch @ {}Hz", in_channels, in_rate);
 
         // TX: samples to play (mono from our modulator, duplicated to all output channels)
         let (tx_sender, tx_receiver): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = bounded(64);
