@@ -396,6 +396,9 @@ pub struct AudioEngine {
 
 impl AudioEngine {
     /// Create a new AudioEngine using the default audio devices.
+    ///
+    /// Adapts to each device's native channel count: output duplicates mono
+    /// samples across all channels, input mixes down to mono.
     pub fn new() -> Result<Self> {
         let host = cpal::default_host();
 
@@ -411,38 +414,53 @@ impl AudioEngine {
         tracing::info!("Audio output device: {}", out_name);
         tracing::info!("Audio input device: {}", in_name);
 
-        if let Ok(cfg) = output_device.default_output_config() {
-            tracing::info!("Output default config: {:?}", cfg);
-        }
-        if let Ok(cfg) = input_device.default_input_config() {
-            tracing::info!("Input default config: {:?}", cfg);
-        }
+        let out_default = output_device.default_output_config()
+            .context("No default output config")?;
+        let in_default = input_device.default_input_config()
+            .context("No default input config")?;
+        tracing::info!("Output default config: {:?}", out_default);
+        tracing::info!("Input default config: {:?}", in_default);
 
-        let stream_config = cpal::StreamConfig {
-            channels: 1,
+        let out_channels = out_default.channels();
+        let in_channels = in_default.channels();
+
+        // Use each device's native channel count to avoid ALSA errors on
+        // devices that only support stereo (common on USB audio on Pi).
+        let out_config = cpal::StreamConfig {
+            channels: out_channels,
             sample_rate: modulator::SAMPLE_RATE,
             buffer_size: cpal::BufferSize::Default,
         };
-        tracing::info!("Requesting stream config: {:?}", stream_config);
+        let in_config = cpal::StreamConfig {
+            channels: in_channels,
+            sample_rate: modulator::SAMPLE_RATE,
+            buffer_size: cpal::BufferSize::Default,
+        };
+        tracing::info!("Output stream: {}ch @ {}Hz", out_channels, modulator::SAMPLE_RATE);
+        tracing::info!("Input stream: {}ch @ {}Hz", in_channels, modulator::SAMPLE_RATE);
 
-        // TX: samples to play
+        // TX: samples to play (mono from our modulator, duplicated to all output channels)
         let (tx_sender, tx_receiver): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = bounded(64);
         let tx_buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
         let tx_buf_clone = tx_buffer.clone();
 
         let output_stream = output_device.build_output_stream(
-            &stream_config,
+            &out_config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 // Drain any queued sample chunks
                 while let Ok(chunk) = tx_receiver.try_recv() {
                     tx_buf_clone.lock().unwrap().extend_from_slice(&chunk);
                 }
                 let mut buf = tx_buf_clone.lock().unwrap();
-                for sample in data.iter_mut() {
-                    if buf.is_empty() {
-                        *sample = 0.0;
+                for frame in data.chunks_mut(out_channels as usize) {
+                    let sample = if buf.is_empty() {
+                        0.0
                     } else {
-                        *sample = buf.remove(0);
+                        buf.remove(0)
+                    };
+                    // Duplicate mono sample to all channels
+                    for ch in frame.iter_mut() {
+                        *ch = sample;
                     }
                 }
             },
@@ -450,13 +468,17 @@ impl AudioEngine {
             None,
         )?;
 
-        // RX: received samples
+        // RX: received samples (mix interleaved multi-channel input down to mono)
         let (rx_sender, rx_receiver): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = bounded(1024);
 
         let input_stream = input_device.build_input_stream(
-            &stream_config,
+            &in_config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                let _ = rx_sender.try_send(data.to_vec());
+                let mono: Vec<f32> = data
+                    .chunks(in_channels as usize)
+                    .map(|frame| frame.iter().sum::<f32>() / in_channels as f32)
+                    .collect();
+                let _ = rx_sender.try_send(mono);
             },
             |err| tracing::error!("Input stream error: {}", err),
             None,
