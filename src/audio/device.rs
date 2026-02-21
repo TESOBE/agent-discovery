@@ -504,21 +504,65 @@ pub struct AudioEngine {
     _input_stream: cpal::Stream,
 }
 
+/// Find a USB audio device by scanning all devices for names containing "USB".
+/// Returns the first hw-level match (one whose supported configs have a fixed
+/// sample rate range, i.e. a real hardware device rather than an ALSA wrapper).
+fn find_usb_output(host: &cpal::Host) -> Option<cpal::Device> {
+    if let Ok(devices) = host.output_devices() {
+        for device in devices {
+            let name = device.description().map(|d| d.name().to_string()).unwrap_or_default();
+            if !name.contains("USB") { continue; }
+            // Prefer hw devices: their supported configs have a narrow rate range
+            if let Ok(mut configs) = device.supported_output_configs() {
+                if let Some(cfg) = configs.next() {
+                    if cfg.min_sample_rate() == cfg.max_sample_rate() {
+                        return Some(device);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_usb_input(host: &cpal::Host) -> Option<cpal::Device> {
+    if let Ok(devices) = host.input_devices() {
+        for device in devices {
+            let name = device.description().map(|d| d.name().to_string()).unwrap_or_default();
+            if !name.contains("USB") { continue; }
+            if let Ok(mut configs) = device.supported_input_configs() {
+                if let Some(cfg) = configs.next() {
+                    if cfg.min_sample_rate() == cfg.max_sample_rate() {
+                        return Some(device);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 impl AudioEngine {
     /// Create a new AudioEngine using the default audio devices.
     ///
+    /// Prefers USB audio devices when available (common on Raspberry Pi where
+    /// the ALSA `default` device may not work correctly with cpal). Falls
+    /// back to the system default devices.
+    ///
     /// Adapts to each device's native channel count, sample rate, and sample
     /// format. Output duplicates mono samples across all channels; input
-    /// mixes down to mono. Handles I16 and F32 sample formats (common on
-    /// USB audio devices on Raspberry Pi).
+    /// mixes down to mono.
     pub fn new() -> Result<Self> {
         let host = cpal::default_host();
 
-        let output_device = host
-            .default_output_device()
+        // Prefer USB devices over the ALSA 'default' wrapper, which often
+        // reports capabilities (e.g. F32) that the underlying hardware
+        // doesn't actually support.
+        let output_device = find_usb_output(&host)
+            .or_else(|| host.default_output_device())
             .context("No output audio device")?;
-        let input_device = host
-            .default_input_device()
+        let input_device = find_usb_input(&host)
+            .or_else(|| host.default_input_device())
             .context("No input audio device")?;
 
         let out_name = output_device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "Unknown".into());
