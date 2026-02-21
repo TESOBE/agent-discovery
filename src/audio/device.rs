@@ -504,65 +504,44 @@ pub struct AudioEngine {
     _input_stream: cpal::Stream,
 }
 
-/// Find a USB audio device by scanning all devices for names containing "USB".
-/// Returns the first hw-level match (one whose supported configs have a fixed
-/// sample rate range, i.e. a real hardware device rather than an ALSA wrapper).
-fn find_usb_output(host: &cpal::Host) -> Option<cpal::Device> {
-    if let Ok(devices) = host.output_devices() {
-        for device in devices {
-            let name = device.description().map(|d| d.name().to_string()).unwrap_or_default();
-            if !name.contains("USB") { continue; }
-            // Prefer hw devices: their supported configs have a narrow rate range
-            if let Ok(mut configs) = device.supported_output_configs() {
-                if let Some(cfg) = configs.next() {
-                    if cfg.min_sample_rate() == cfg.max_sample_rate() {
-                        return Some(device);
-                    }
-                }
+/// Pick the best sample format for a device: prefer I16 (works on USB
+/// hardware that only supports I16) and fall back to F32.
+fn pick_output_format(device: &cpal::Device) -> cpal::SampleFormat {
+    if let Ok(configs) = device.supported_output_configs() {
+        for cfg in configs {
+            if cfg.sample_format() == cpal::SampleFormat::I16 {
+                return cpal::SampleFormat::I16;
             }
         }
     }
-    None
+    cpal::SampleFormat::F32
 }
 
-fn find_usb_input(host: &cpal::Host) -> Option<cpal::Device> {
-    if let Ok(devices) = host.input_devices() {
-        for device in devices {
-            let name = device.description().map(|d| d.name().to_string()).unwrap_or_default();
-            if !name.contains("USB") { continue; }
-            if let Ok(mut configs) = device.supported_input_configs() {
-                if let Some(cfg) = configs.next() {
-                    if cfg.min_sample_rate() == cfg.max_sample_rate() {
-                        return Some(device);
-                    }
-                }
+fn pick_input_format(device: &cpal::Device) -> cpal::SampleFormat {
+    if let Ok(configs) = device.supported_input_configs() {
+        for cfg in configs {
+            if cfg.sample_format() == cpal::SampleFormat::I16 {
+                return cpal::SampleFormat::I16;
             }
         }
     }
-    None
+    cpal::SampleFormat::F32
 }
 
 impl AudioEngine {
     /// Create a new AudioEngine using the default audio devices.
     ///
-    /// Prefers USB audio devices when available (common on Raspberry Pi where
-    /// the ALSA `default` device may not work correctly with cpal). Falls
-    /// back to the system default devices.
-    ///
-    /// Adapts to each device's native channel count, sample rate, and sample
-    /// format. Output duplicates mono samples across all channels; input
-    /// mixes down to mono.
+    /// Uses the ALSA default device (configured via ~/.asoundrc on Pi to
+    /// use plughw wrappers around USB hardware). Probes supported formats
+    /// and prefers I16 over F32, since USB audio devices on Pi typically
+    /// only support I16 and the ALSA default wrapper may falsely advertise
+    /// F32 support.
     pub fn new() -> Result<Self> {
         let host = cpal::default_host();
 
-        // Prefer USB devices over the ALSA 'default' wrapper, which often
-        // reports capabilities (e.g. F32) that the underlying hardware
-        // doesn't actually support.
-        let output_device = find_usb_output(&host)
-            .or_else(|| host.default_output_device())
+        let output_device = host.default_output_device()
             .context("No output audio device")?;
-        let input_device = find_usb_input(&host)
-            .or_else(|| host.default_input_device())
+        let input_device = host.default_input_device()
             .context("No input audio device")?;
 
         let out_name = output_device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "Unknown".into());
@@ -577,14 +556,15 @@ impl AudioEngine {
         tracing::info!("Output default config: {:?}", out_default);
         tracing::info!("Input default config: {:?}", in_default);
 
-        // Use each device's native settings to avoid ALSA errors on USB
-        // devices that only support specific formats (e.g. stereo I16 at 48kHz).
+        // Use the default config's channels and sample rate, but probe
+        // for the actual supported sample format (the default may lie
+        // about F32 support on USB devices behind plughw wrappers).
         let out_channels = out_default.channels();
         let in_channels = in_default.channels();
         let out_rate = out_default.sample_rate();
         let in_rate = in_default.sample_rate();
-        let out_fmt = out_default.sample_format();
-        let in_fmt = in_default.sample_format();
+        let out_fmt = pick_output_format(&output_device);
+        let in_fmt = pick_input_format(&input_device);
 
         let out_config = cpal::StreamConfig {
             channels: out_channels,
