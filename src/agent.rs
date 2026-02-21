@@ -1,6 +1,6 @@
 /// Agent orchestrator: ties audio, discovery, negotiation, and OBP together.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -19,6 +19,102 @@ use crate::obp::client::ObpClient;
 use crate::obp::entities;
 use crate::obp::exploration::ExplorationMsg;
 use crate::protocol::{codec, message::Capabilities};
+
+// ---------------------------------------------------------------------------
+// Agent mood — a simple status reflecting connectivity to other peers.
+// ---------------------------------------------------------------------------
+
+/// Agent mood based on peer connectivity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AgentMood {
+    /// Audio doesn't work, can't reach signal channels or network.
+    Struggling = 0,
+    /// Can broadcast (audio or signal channels) but no peer is responding.
+    Lonely = 1,
+    /// Connected to exactly one other agent.
+    Happy = 2,
+    /// Connected to exactly two other agents.
+    VeryHappy = 3,
+    /// Connected to three or more other agents.
+    Party = 4,
+}
+
+impl AgentMood {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            0 => Self::Struggling,
+            1 => Self::Lonely,
+            2 => Self::Happy,
+            3 => Self::VeryHappy,
+            4 => Self::Party,
+            _ => Self::Party,
+        }
+    }
+
+    /// Human-friendly label for logs.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Struggling => "Struggling",
+            Self::Lonely => "Lonely",
+            Self::Happy => "Happy",
+            Self::VeryHappy => "Very Happy",
+            Self::Party => "Party!",
+        }
+    }
+
+    /// Compute mood from the number of connected peers.
+    pub fn from_peer_count(count: usize) -> Self {
+        match count {
+            0 => Self::Lonely,
+            1 => Self::Happy,
+            2 => Self::VeryHappy,
+            _ => Self::Party,
+        }
+    }
+}
+
+impl std::fmt::Display for AgentMood {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.label())
+    }
+}
+
+/// Thread-safe mood tracker backed by an AtomicU8.
+#[derive(Clone)]
+pub struct MoodTracker {
+    value: Arc<AtomicU8>,
+}
+
+impl MoodTracker {
+    pub fn new(initial: AgentMood) -> Self {
+        Self { value: Arc::new(AtomicU8::new(initial as u8)) }
+    }
+
+    pub fn get(&self) -> AgentMood {
+        AgentMood::from_u8(self.value.load(Ordering::Relaxed))
+    }
+
+    /// Update mood and log if it changed. Returns true if mood changed.
+    pub fn set(&self, mood: AgentMood) -> bool {
+        let old = self.value.swap(mood as u8, Ordering::Relaxed);
+        if old != mood as u8 {
+            let old_mood = AgentMood::from_u8(old);
+            tracing::info!(
+                old = %old_mood, new = %mood,
+                "Agent mood changed: {} -> {}", old_mood, mood
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Update mood from the current peer count.
+    pub fn update_from_peers(&self, peer_count: usize) {
+        self.set(AgentMood::from_peer_count(peer_count));
+    }
+}
 
 /// Run the main agent loop.
 /// If `udp_only` is true, skip audio discovery and start UDP immediately.
@@ -164,6 +260,17 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
         }
     };
 
+    // Agent mood — reflects connectivity status
+    let has_audio = audio_engine.is_some();
+    let has_obp = obp_client.is_some();
+    let initial_mood = if !has_audio && !has_obp {
+        AgentMood::Struggling
+    } else {
+        AgentMood::Lonely
+    };
+    let mood = MoodTracker::new(initial_mood);
+    tracing::info!(mood = %mood.get(), "Initial agent mood: {}", mood.get());
+
     // Shared flag: when true, the RX loop discards samples to avoid self-echo
     let is_transmitting = Arc::new(AtomicBool::new(false));
     // Set to true when a peer is discovered, tells TX loop to reset back-off
@@ -238,6 +345,26 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
     // Track peers we've already negotiated with, so we don't re-negotiate on PeerUpdated
     let mut negotiated_peers = std::collections::HashSet::<Uuid>::new();
 
+    // Periodic mood/status logger (every 30 seconds)
+    {
+        let mgr = discovery_manager.clone();
+        let m = mood.clone();
+        let name = agent_name.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                let peer_count = mgr.lock().await.peers().len();
+                m.update_from_peers(peer_count);
+                tracing::info!(
+                    mood = %m.get(),
+                    peers = peer_count,
+                    "Agent '{}' status: {} ({} peer{})",
+                    name, m.get(), peer_count, if peer_count == 1 { "" } else { "s" }
+                );
+            }
+        }.instrument(agent_span.clone()));
+    }
+
     // Run the event loop inside the agent span
     let _guard = agent_span.enter();
 
@@ -248,10 +375,18 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
                     // Reset announce back-off so we respond quickly
                     peer_found.store(true, Ordering::Release);
 
+                    let peer_count = {
+                        let mgr = discovery_manager.lock().await;
+                        mgr.peers().len()
+                    };
+                    mood.update_from_peers(peer_count);
+
                     tracing::info!(
                         peer_id = %peer.agent_id,
                         address = %peer.address,
-                        "New peer discovered! Starting negotiation..."
+                        mood = %mood.get(),
+                        "New peer discovered! Mood: {}. Starting negotiation...",
+                        mood.get()
                     );
 
                     handle_new_peer(
@@ -273,8 +408,18 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
                     tracing::debug!(peer_id = %peer.agent_id, "Peer updated");
                 }
                 DiscoveryEvent::PeerLost(id) => {
-                    tracing::info!(peer_id = %id, "Peer lost");
                     negotiated_peers.remove(&id);
+                    let peer_count = {
+                        let mgr = discovery_manager.lock().await;
+                        mgr.peers().len()
+                    };
+                    mood.update_from_peers(peer_count);
+                    tracing::info!(
+                        peer_id = %id,
+                        mood = %mood.get(),
+                        "Peer lost. Mood: {} ({} peer{} remaining)",
+                        mood.get(), peer_count, if peer_count == 1 { "" } else { "s" }
+                    );
                 }
             },
             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
