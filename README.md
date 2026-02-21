@@ -158,6 +158,7 @@ cargo --version
 ```
 cp .env.example .env
 # Edit .env - at minimum set CLAUDE_API_KEY
+# Set INSTRUCTOR_USER_IDS to the OBP user IDs allowed to send task requests
 ```
 
 ## Run

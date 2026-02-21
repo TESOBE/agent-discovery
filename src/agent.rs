@@ -3,7 +3,7 @@
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::Arc;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 use tracing::Instrument;
 use uuid::Uuid;
 
@@ -373,30 +373,46 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
         let mgr = discovery_manager.clone();
         let m = mood.clone();
         let name = agent_name.clone();
+        let own_addr = agent_address.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 let mgr_guard = mgr.lock().await;
                 let peer_count = mgr_guard.peers().len();
-                let peer_obp_urls: Vec<String> = mgr_guard.peers().iter()
-                    .filter(|p| !p.obp_api_base_url.is_empty())
-                    .map(|p| format!("{}={}", p.address, p.obp_api_base_url))
+                let peer_summaries: Vec<String> = mgr_guard.peers().iter()
+                    .map(|p| p.summary(&own_addr))
                     .collect();
                 drop(mgr_guard);
                 m.update_from_peers(peer_count);
-                if peer_obp_urls.is_empty() {
+                if peer_count > 1 {
                     tracing::info!(
-                        "Agent '{}' mood: {} ({} peer{})",
-                        name, m.summary(), peer_count, if peer_count == 1 { "" } else { "s" }
+                        "Agent '{}' mood: {} ({} peers)\n  {}",
+                        name, m.summary(), peer_count,
+                        peer_summaries.join("\n  ")
+                    );
+                } else if peer_count == 1 {
+                    tracing::info!(
+                        "Agent '{}' mood: {} (1 peer: {})",
+                        name, m.summary(), peer_summaries[0]
                     );
                 } else {
                     tracing::info!(
-                        "Agent '{}' mood: {} ({} peer{}, OBP URLs: {})",
-                        name, m.summary(), peer_count, if peer_count == 1 { "" } else { "s" },
-                        peer_obp_urls.join(", ")
+                        "Agent '{}' mood: {} (0 peers)",
+                        name, m.summary()
                     );
                 }
             }
+        }.instrument(agent_span.clone()));
+    }
+
+    // Poll "task-requests" signal channel for work
+    if let Some(ref obp) = obp_client {
+        let obp = obp.clone();
+        let name = agent_name.clone();
+        let cfg = config.clone();
+        let mcp = mcp_client.clone();
+        tokio::spawn(async move {
+            run_task_request_poller(obp, name, cfg, mcp).await;
         }.instrument(agent_span.clone()));
     }
 
@@ -1789,6 +1805,343 @@ async fn read_signal_messages_via_http(
     Ok(response)
 }
 
+/// Poll the "task-requests" signal channel for work items posted by external
+/// systems or other agents. Acknowledges receipt, processes the task via Claude,
+/// and posts a `task-response` back to the channel.
+async fn run_task_request_poller(
+    obp: Arc<ObpClient>,
+    agent_name: String,
+    config: Config,
+    mcp_client: Option<Arc<tokio::sync::Mutex<McpClient>>>,
+) {
+    use std::collections::HashSet;
+
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    // Wait before first poll to let auth and startup settle
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+
+    tracing::info!("Task poller: watching signal channel 'task-requests'");
+
+    loop {
+        match read_signal_messages_via_http(&obp, "task-requests").await {
+            Ok(response) => {
+                if let Some(messages) = response.get("messages").and_then(|m| m.as_array()) {
+                    for msg in messages {
+                        let msg_id = msg.get("message_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        if msg_id.is_empty() || seen_ids.contains(&msg_id) {
+                            continue;
+                        }
+                        seen_ids.insert(msg_id.clone());
+
+                        // Extract the payload (task details)
+                        let payload = msg.get("payload").cloned()
+                            .unwrap_or(serde_json::Value::Null);
+
+                        // Skip our own acks and responses to avoid infinite loops
+                        let msg_type = payload.get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if msg_type == "task-ack" || msg_type == "task-response" {
+                            tracing::debug!(
+                                message_id = %msg_id,
+                                msg_type = %msg_type,
+                                "Task poller: skipping non-request message"
+                            );
+                            continue;
+                        }
+
+                        // Authorization check: only process tasks from
+                        // configured instructor users. If no instructors are
+                        // configured, all tasks are rejected.
+                        let sender = msg.get("sender_user_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        if !config.instructor_user_ids.iter().any(|id| id == sender) {
+                            tracing::warn!(
+                                message_id = %msg_id,
+                                sender = %sender,
+                                "Task poller: ignoring task from non-instructor sender"
+                            );
+                            continue;
+                        }
+
+                        tracing::info!(
+                            message_id = %msg_id,
+                            "Task poller: new task received: {}",
+                            payload
+                        );
+
+                        // Acknowledge receipt
+                        let ack = serde_json::json!({
+                            "payload": {
+                                "type": "task-ack",
+                                "from": agent_name,
+                                "in_reply_to": msg_id,
+                                "timestamp": crate::obp::entities::iso_now(),
+                                "message": format!(
+                                    "Agent '{}' received task {}",
+                                    agent_name, msg_id
+                                ),
+                            }
+                        });
+                        if let Err(e) = publish_signal_message_via_http(
+                            &obp, "task-requests", &ack
+                        ).await {
+                            tracing::warn!("Task poller: failed to ack task {}: {}", msg_id, e);
+                        }
+
+                        // Process the task via Claude and post a response
+                        let response_payload = match process_task_request(
+                            &config, &mcp_client, &obp, &agent_name, &msg_id, &payload
+                        ).await {
+                            Ok(response_text) => {
+                                tracing::info!(
+                                    message_id = %msg_id,
+                                    "Task poller: processed task, posting response"
+                                );
+                                serde_json::json!({
+                                    "payload": {
+                                        "type": "task-response",
+                                        "from": agent_name,
+                                        "in_reply_to": msg_id,
+                                        "status": "completed",
+                                        "response": response_text,
+                                        "timestamp": crate::obp::entities::iso_now(),
+                                    }
+                                })
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    message_id = %msg_id,
+                                    "Task poller: failed to process task: {}", e
+                                );
+                                serde_json::json!({
+                                    "payload": {
+                                        "type": "task-response",
+                                        "from": agent_name,
+                                        "in_reply_to": msg_id,
+                                        "status": "error",
+                                        "response": format!("Error processing task: {}", e),
+                                        "timestamp": crate::obp::entities::iso_now(),
+                                    }
+                                })
+                            }
+                        };
+
+                        if let Err(e) = publish_signal_message_via_http(
+                            &obp, "task-requests", &response_payload
+                        ).await {
+                            tracing::warn!(
+                                "Task poller: failed to post task-response for {}: {}",
+                                msg_id, e
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::debug!("Task poller: failed to read task-requests: {}", e);
+            }
+        }
+
+        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+    }
+}
+
+/// Process a task request by calling the Claude API with MCP tools.
+///
+/// Returns Claude's final text response, or an error if the API key is missing
+/// or the call fails.
+async fn process_task_request(
+    config: &Config,
+    mcp_client: &Option<Arc<tokio::sync::Mutex<McpClient>>>,
+    _obp: &ObpClient,
+    agent_name: &str,
+    msg_id: &str,
+    payload: &serde_json::Value,
+) -> Result<String> {
+    if config.claude_api_key.is_empty() {
+        anyhow::bail!("No claude_api_key configured — cannot process task");
+    }
+
+    let system_prompt = format!(
+        r#"You are agent '{agent_name}', an autonomous AI agent participating in a multi-agent discovery network.
+
+A task has been posted to the task-requests signal channel. Process this task and respond helpfully.
+
+Agent Directives:
+{directives}
+
+These directives guide your decisions. Prioritise helping struggling peers (Principle 1).
+Respect all constraints. Work towards the stated objectives and aims.
+
+If OBP tools are available, you may use them to query banking data (accounts, transactions, etc.) to answer the task.
+Provide a clear, concise answer. Do not return JSON unless the task specifically asks for it."#,
+        agent_name = agent_name,
+        directives = crate::directives::format_directives(),
+    );
+
+    let user_message = format!(
+        "Task ID: {msg_id}\nTask payload:\n{payload}",
+        msg_id = msg_id,
+        payload = serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string()),
+    );
+
+    // Gather MCP tools if available
+    let tools: Vec<serde_json::Value> = if let Some(ref mcp) = mcp_client {
+        let guard = mcp.lock().await;
+        guard.tools_as_claude_tools()
+    } else {
+        vec![]
+    };
+
+    // Build initial messages
+    let mut messages = vec![serde_json::json!({
+        "role": "user",
+        "content": user_message,
+    })];
+
+    let http_client = reqwest::Client::new();
+
+    // Tool-use loop (same pattern as negotiation)
+    let max_iterations = 10;
+    for iteration in 0..max_iterations {
+        let response = call_claude_for_task(
+            &http_client,
+            &config.claude_api_key,
+            &config.claude_model,
+            &system_prompt,
+            &messages,
+            &tools,
+        ).await?;
+
+        tracing::info!(
+            iteration,
+            stop_reason = ?response.get("stop_reason").and_then(|v| v.as_str()),
+            "Task processing: Claude response received"
+        );
+
+        let content = response.get("content")
+            .and_then(|c| c.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        // Check for tool use
+        let has_tool_use = content.iter().any(|block|
+            block.get("type").and_then(|t| t.as_str()) == Some("tool_use")
+        );
+
+        if has_tool_use && mcp_client.is_some() {
+            // Add assistant message with all content blocks
+            messages.push(serde_json::json!({
+                "role": "assistant",
+                "content": content,
+            }));
+
+            // Execute each tool call and collect results
+            let mut tool_results = Vec::new();
+            for block in &content {
+                if block.get("type").and_then(|t| t.as_str()) == Some("tool_use") {
+                    let tool_id = block.get("id").and_then(|v| v.as_str()).unwrap_or("");
+                    let tool_name = block.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                    let tool_input = block.get("input").cloned().unwrap_or(serde_json::Value::Null);
+
+                    tracing::info!(tool = %tool_name, "Task processing: executing MCP tool call");
+
+                    let result = if let Some(ref mcp) = mcp_client {
+                        let mut guard = mcp.lock().await;
+                        match guard.call_tool(tool_name, tool_input).await {
+                            Ok(val) => serde_json::to_string_pretty(&val)
+                                .unwrap_or_else(|_| val.to_string()),
+                            Err(e) => format!("Error calling tool: {}", e),
+                        }
+                    } else {
+                        "MCP client not available".to_string()
+                    };
+
+                    tool_results.push(serde_json::json!({
+                        "type": "tool_result",
+                        "tool_use_id": tool_id,
+                        "content": result,
+                    }));
+                }
+            }
+
+            // Add tool results as user message
+            messages.push(serde_json::json!({
+                "role": "user",
+                "content": tool_results,
+            }));
+        } else {
+            // Claude is done — extract final text
+            let mut full_text = String::new();
+            for block in &content {
+                if block.get("type").and_then(|t| t.as_str()) == Some("text") {
+                    if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
+                        full_text.push_str(text);
+                    }
+                }
+            }
+            if full_text.is_empty() {
+                anyhow::bail!("Claude returned no text content");
+            }
+            return Ok(full_text);
+        }
+    }
+
+    anyhow::bail!("Task processing exceeded maximum iterations")
+}
+
+/// Call the Claude Messages API for task processing.
+///
+/// Standalone function (not tied to ClaudeNegotiator) to keep task processing
+/// self-contained in agent.rs.
+async fn call_claude_for_task(
+    http_client: &reqwest::Client,
+    api_key: &str,
+    model: &str,
+    system: &str,
+    messages: &[serde_json::Value],
+    tools: &[serde_json::Value],
+) -> Result<serde_json::Value> {
+    let mut body = serde_json::json!({
+        "model": model,
+        "max_tokens": 4096,
+        "system": system,
+        "messages": messages,
+    });
+
+    if !tools.is_empty() {
+        body["tools"] = serde_json::Value::Array(tools.to_vec());
+    }
+
+    let response = http_client
+        .post("https://api.anthropic.com/v1/messages")
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .context("Failed to send request to Claude API")?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let error_text = response.text().await.unwrap_or_default();
+        anyhow::bail!("Claude API error ({}): {}", status, error_text);
+    }
+
+    let claude_response: serde_json::Value = response
+        .json()
+        .await
+        .context("Failed to parse Claude API response")?;
+
+    Ok(claude_response)
+}
+
 /// Back-off parameters for the UDP announce loop.
 const INITIAL_INTERVAL_MS: u64 = 15000;
 const MAX_INTERVAL_MS: u64 = 60000;
@@ -2177,9 +2530,10 @@ async fn run_receive_loop(
                         "",
                     );
                     mgr.handle_message(&msg);
-                    // Set next_hello_mins on the newly added peer
+                    // Set next_hello_mins and discovery method on the newly added peer
                     if let Some(peer) = mgr.peers_mut().get_mut(&pseudo_id) {
                         peer.next_hello_mins = next_hello_mins;
+                        peer.discovery_method = crate::discovery::peer::DiscoveryMethod::Audio;
                     }
                 }
 
@@ -2488,6 +2842,12 @@ async fn run_udp_receive_loop(
                     let obp_url = if msg.obp_api_base_url.is_empty() { "(none)".to_string() } else { msg.obp_api_base_url.clone() };
                     let mut mgr = manager.lock().await;
                     if mgr.handle_message(&msg) {
+                        // Tag newly discovered peers with UDP discovery method
+                        if let Some(peer) = mgr.peers_mut().get_mut(&msg.agent_id) {
+                            if peer.discovery_method == crate::discovery::peer::DiscoveryMethod::Unknown {
+                                peer.discovery_method = crate::discovery::peer::DiscoveryMethod::Udp;
+                            }
+                        }
                         tracing::info!(
                             peer_id = %msg.agent_id,
                             address = %msg.address,

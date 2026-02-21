@@ -5,6 +5,27 @@ use crate::protocol::message::Capabilities;
 use std::time::Instant;
 use uuid::Uuid;
 
+/// How we first discovered this peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryMethod {
+    /// Not yet known (shouldn't persist — set immediately after registration).
+    Unknown,
+    /// Discovered via audio chirp (speaker/microphone).
+    Audio,
+    /// Discovered via UDP broadcast.
+    Udp,
+}
+
+impl std::fmt::Display for DiscoveryMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DiscoveryMethod::Unknown => write!(f, "unknown"),
+            DiscoveryMethod::Audio => write!(f, "audio"),
+            DiscoveryMethod::Udp => write!(f, "UDP"),
+        }
+    }
+}
+
 /// Fallback timeout if a peer doesn't advertise its next hello interval.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
@@ -28,6 +49,8 @@ pub struct Peer {
     /// `None` = no chunks arriving yet.
     /// `Some(vec)` = vec of length `total_chunks`, each slot `None` or `Some(data)`.
     pub url_chunks: Option<Vec<Option<Vec<u8>>>>,
+    /// How this peer was first discovered.
+    pub discovery_method: DiscoveryMethod,
 }
 
 impl Peer {
@@ -42,6 +65,7 @@ impl Peer {
             next_hello_mins: 0,
             obp_api_base_url,
             url_chunks: None,
+            discovery_method: DiscoveryMethod::Unknown,
         }
     }
 
@@ -110,5 +134,30 @@ impl Peer {
     /// Check if this peer has timed out.
     pub fn is_expired(&self) -> bool {
         self.last_seen.elapsed().as_secs() >= self.timeout_secs()
+    }
+
+    /// Check if this peer appears to be on the same /24 subnet as us.
+    pub fn is_same_network(&self, own_address: &str) -> bool {
+        fn subnet(addr: &str) -> Option<&str> {
+            let ip = addr.rsplit(':').nth(1).unwrap_or(addr.split(':').next().unwrap_or(addr));
+            ip.rsplitn(2, '.').nth(1)
+        }
+        match (subnet(own_address), subnet(&self.address)) {
+            (Some(a), Some(b)) => a == b,
+            _ => false,
+        }
+    }
+
+    /// One-line summary of this peer for logging.
+    pub fn summary(&self, own_address: &str) -> String {
+        let net = if self.is_same_network(own_address) { "same-net" } else { "remote" };
+        let caps = self.capabilities.describe();
+        let age = self.first_seen.elapsed().as_secs();
+        let obp = if self.obp_api_base_url.is_empty() { "no-OBP" } else { &self.obp_api_base_url };
+        format!(
+            "{}@{} [{}] via={} {} caps=[{}] age={}s",
+            &self.agent_id.to_string()[..8], self.address, net,
+            self.discovery_method, obp, caps, age
+        )
     }
 }

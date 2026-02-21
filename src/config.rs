@@ -14,6 +14,9 @@ pub struct Config {
     pub obp_mcp_server_url: Option<String>,
     /// Directory for log files. Defaults to /tmp/agent-discovery.
     pub log_dir: String,
+    /// Comma-separated list of OBP user IDs allowed to instruct this agent.
+    /// If empty, all task requests are rejected (closed by default).
+    pub instructor_user_ids: Vec<String>,
 }
 
 impl Config {
@@ -44,6 +47,12 @@ impl Config {
                 .unwrap_or_else(|_| "http://0.0.0.0:9100/mcp".into())),
             log_dir: std::env::var("LOG_DIR")
                 .unwrap_or_else(|_| "/tmp/agent-discovery".into()),
+            instructor_user_ids: std::env::var("INSTRUCTOR_USER_IDS")
+                .unwrap_or_default()
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
         })
     }
 }
