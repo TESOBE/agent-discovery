@@ -3,6 +3,7 @@
 pub mod audio;
 pub mod comms;
 pub mod config;
+pub mod directives;
 pub mod discovery;
 pub mod mcp;
 pub mod negotiation;

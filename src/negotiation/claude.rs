@@ -121,12 +121,18 @@ OBP provides Redis-backed signal channels for ephemeral agent messaging at /obp/
 Prefer TCP/IP for low-latency direct communication when both agents are on the same network.
 Use OBP signal channels for cross-network coordination when direct TCP/IP isn't possible.
 Use OBP dynamic entities for persistent shared data.
+
+Agent Directives:
+{directives}
+These directives guide your decisions. Prioritise helping struggling peers (Principle 1).
+Respect all constraints. Work towards the stated objectives and aims.
 "#,
             our_agent_id = our_agent_id,
             our_address = our_address,
             peer_id = peer.agent_id,
             peer_address = peer.address,
             capabilities = peer.capabilities,
+            directives = crate::directives::format_directives(),
         );
 
         // Build tools list from MCP if available

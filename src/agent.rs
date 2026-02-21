@@ -286,6 +286,9 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
         capabilities = capabilities.with_audio();
     }
 
+    // Log agent directives
+    tracing::info!("Agent directives:\n{}", crate::directives::format_directives());
+
     // Agent mood — peer connectivity + capabilities
     let mood = AgentMoodTracker::new(capabilities);
     tracing::info!(mood = %mood.summary(), "Initial agent mood: {}", mood.summary());

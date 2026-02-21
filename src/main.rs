@@ -4,6 +4,7 @@ mod agent;
 mod audio;
 mod comms;
 mod config;
+mod directives;
 mod discovery;
 mod mcp;
 mod negotiation;
