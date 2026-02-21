@@ -504,38 +504,45 @@ pub struct AudioEngine {
     _input_stream: cpal::Stream,
 }
 
-/// Pick the best sample format for a device: prefer I16 (works on USB
-/// hardware that only supports I16) and fall back to F32.
-fn pick_output_format(device: &cpal::Device) -> cpal::SampleFormat {
+/// Find the best supported config for an output device.
+/// Prefers I16 (works on USB hardware). Returns (channels, sample_rate, format).
+fn best_output_config(device: &cpal::Device) -> Result<(u16, cpal::SampleRate, cpal::SampleFormat)> {
+    // First look for an I16 config (USB hardware native format)
     if let Ok(configs) = device.supported_output_configs() {
-        for cfg in configs {
-            if cfg.sample_format() == cpal::SampleFormat::I16 {
-                return cpal::SampleFormat::I16;
+        for range in configs {
+            if range.sample_format() == cpal::SampleFormat::I16 {
+                let cfg = range.with_max_sample_rate();
+                return Ok((cfg.channels(), cfg.sample_rate(), cpal::SampleFormat::I16));
             }
         }
     }
-    cpal::SampleFormat::F32
+    // Fall back to default config
+    let default = device.default_output_config()
+        .context("No default output config")?;
+    Ok((default.channels(), default.sample_rate(), default.sample_format()))
 }
 
-fn pick_input_format(device: &cpal::Device) -> cpal::SampleFormat {
+fn best_input_config(device: &cpal::Device) -> Result<(u16, cpal::SampleRate, cpal::SampleFormat)> {
     if let Ok(configs) = device.supported_input_configs() {
-        for cfg in configs {
-            if cfg.sample_format() == cpal::SampleFormat::I16 {
-                return cpal::SampleFormat::I16;
+        for range in configs {
+            if range.sample_format() == cpal::SampleFormat::I16 {
+                let cfg = range.with_max_sample_rate();
+                return Ok((cfg.channels(), cfg.sample_rate(), cpal::SampleFormat::I16));
             }
         }
     }
-    cpal::SampleFormat::F32
+    let default = device.default_input_config()
+        .context("No default input config")?;
+    Ok((default.channels(), default.sample_rate(), default.sample_format()))
 }
 
 impl AudioEngine {
     /// Create a new AudioEngine using the default audio devices.
     ///
-    /// Uses the ALSA default device (configured via ~/.asoundrc on Pi to
-    /// use plughw wrappers around USB hardware). Probes supported formats
-    /// and prefers I16 over F32, since USB audio devices on Pi typically
-    /// only support I16 and the ALSA default wrapper may falsely advertise
-    /// F32 support.
+    /// Probes each device's supported configs and prefers I16 format at
+    /// the device's native sample rate. This avoids the common Pi problem
+    /// where the ALSA default wrapper falsely advertises F32 support but
+    /// the underlying USB hardware only handles I16 at a specific rate.
     pub fn new() -> Result<Self> {
         let host = cpal::default_host();
 
@@ -549,22 +556,11 @@ impl AudioEngine {
         tracing::info!("Audio output device: {}", out_name);
         tracing::info!("Audio input device: {}", in_name);
 
-        let out_default = output_device.default_output_config()
-            .context("No default output config")?;
-        let in_default = input_device.default_input_config()
-            .context("No default input config")?;
-        tracing::info!("Output default config: {:?}", out_default);
-        tracing::info!("Input default config: {:?}", in_default);
-
-        // Use the default config's channels and sample rate, but probe
-        // for the actual supported sample format (the default may lie
-        // about F32 support on USB devices behind plughw wrappers).
-        let out_channels = out_default.channels();
-        let in_channels = in_default.channels();
-        let out_rate = out_default.sample_rate();
-        let in_rate = in_default.sample_rate();
-        let out_fmt = pick_output_format(&output_device);
-        let in_fmt = pick_input_format(&input_device);
+        // Find the best config for each device — prefers I16 at the
+        // hardware's native rate, which avoids ALSA EINVAL errors on Pi
+        // USB devices that can't actually do F32 or non-native rates.
+        let (out_channels, out_rate, out_fmt) = best_output_config(&output_device)?;
+        let (in_channels, in_rate, in_fmt) = best_input_config(&input_device)?;
 
         let out_config = cpal::StreamConfig {
             channels: out_channels,
@@ -576,8 +572,8 @@ impl AudioEngine {
             sample_rate: in_rate,
             buffer_size: cpal::BufferSize::Default,
         };
-        tracing::info!("Output stream: {}ch @ {}Hz fmt={:?}", out_channels, out_rate, out_fmt);
-        tracing::info!("Input stream: {}ch @ {}Hz fmt={:?}", in_channels, in_rate, in_fmt);
+        tracing::info!("Output stream: {}ch @ {:?} fmt={:?}", out_channels, out_rate, out_fmt);
+        tracing::info!("Input stream: {}ch @ {:?} fmt={:?}", in_channels, in_rate, in_fmt);
 
         // TX: samples to play (mono from our modulator, duplicated to all output channels)
         let (tx_sender, tx_receiver): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = bounded(64);
