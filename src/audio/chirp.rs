@@ -1144,49 +1144,89 @@ fn try_decode_sweep_at_frame(
 /// Ensures decoders can distinguish a hello message from a URL burst.
 const URL_PREAMBLE: [u8; 8] = [0, 1, 0, 1, 0, 1, 0, 1];
 
-/// Encode a URL string into a binary chirp audio burst.
-///
-/// Format: `[url_preamble: 8] [sync: 4] [url_length: 8] [url_bytes: N×8] [checksum: 8]`
-///
-/// Uses the same up/down data chirps as hello messages but with the
-/// inverted `URL_PREAMBLE` so decoders can tell them apart.
-///
-/// Checksum: XOR of `url_length` and all URL bytes.
-pub fn encode_chirp_url(url: &str, sample_rate: u32) -> Vec<f32> {
-    let url_bytes = url.as_bytes();
-    if url_bytes.len() > 255 {
-        // URL too long for 1-byte length field — truncate silently
-        return encode_chirp_url(&url[..255], sample_rate);
-    }
+/// Maximum payload bytes per URL chunk. 6 bytes keeps each chunk ~8s at 10bps.
+pub const CHUNK_SIZE: usize = 6;
 
+/// A single chunk of a URL being transmitted via chirp.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UrlChunk {
+    /// 0-based chunk index.
+    pub chunk_index: u8,
+    /// Total number of chunks for this URL.
+    pub total_chunks: u8,
+    /// Chunk payload (up to CHUNK_SIZE bytes).
+    pub data: Vec<u8>,
+}
+
+/// Split a URL string into chunks for transmission.
+///
+/// Each chunk carries up to `CHUNK_SIZE` bytes of the URL.
+pub fn split_url_into_chunks(url: &str) -> Vec<UrlChunk> {
+    let url_bytes = url.as_bytes();
+    let total_chunks = (url_bytes.len() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    let total_chunks = total_chunks.max(1) as u8;
+
+    url_bytes
+        .chunks(CHUNK_SIZE)
+        .enumerate()
+        .map(|(i, chunk_data)| UrlChunk {
+            chunk_index: i as u8,
+            total_chunks,
+            data: chunk_data.to_vec(),
+        })
+        .collect()
+}
+
+/// Encode a URL chunk into a binary chirp audio burst.
+///
+/// Format: `[URL_PREAMBLE:8] [SYNC:4] [chunk_index:4] [total_chunks:4] [chunk_len:4] [chunk_data:N×8] [checksum:8]`
+///
+/// - chunk_index: 4 bits (0-15, supports up to 16 chunks = 96 bytes URL)
+/// - total_chunks: 4 bits (1-16, encoded as value-1 so 0 means 1)
+/// - chunk_len: 4 bits (1-6, actual byte count in this chunk, encoded as value-1)
+/// - checksum: XOR of (chunk_index | total_chunks<<4), chunk_len, and all chunk data bytes
+///
+/// Total bits per chunk: 8+4+4+4+4+N×8+8 = 32 + N×8 bits (max 80 bits = 8s for 6 bytes)
+pub fn encode_chirp_url_chunk(chunk: &UrlChunk, sample_rate: u32) -> Vec<f32> {
     let up = data_up_chirp(sample_rate);
     let down = data_down_chirp(sample_rate);
     let gap_samples = (DATA_CHIRP_GAP * sample_rate as f32) as usize;
     let gap = vec![0.0f32; gap_samples];
 
-    let url_len = url_bytes.len() as u8;
-    let mut checksum = url_len;
-    for &b in url_bytes {
+    let chunk_len = chunk.data.len() as u8;
+    let meta_byte = chunk.chunk_index | (chunk.total_chunks.saturating_sub(1) << 4);
+    let mut checksum = meta_byte ^ chunk_len;
+    for &b in &chunk.data {
         checksum ^= b;
     }
 
-    // Build bit sequence: preamble(8) + sync(4) + url_len(8) + url_bytes(N*8) + checksum(8)
-    let total_bits = 8 + 4 + 8 + url_bytes.len() * 8 + 8;
+    // Build bit sequence
+    let total_bits = 8 + 4 + 4 + 4 + 4 + chunk.data.len() * 8 + 8;
     let mut bits: Vec<u8> = Vec::with_capacity(total_bits);
     bits.extend_from_slice(&URL_PREAMBLE);
     bits.extend_from_slice(&SYNC);
 
-    // URL length: 8 bits
-    for bit_pos in (0..8).rev() {
-        bits.push((url_len >> bit_pos) & 1);
+    // chunk_index: 4 bits
+    for bit_pos in (0..4).rev() {
+        bits.push((chunk.chunk_index >> bit_pos) & 1);
     }
-    // URL bytes
-    for &byte in url_bytes {
+    // total_chunks: 4 bits (encoded as value-1)
+    let tc_encoded = chunk.total_chunks.saturating_sub(1);
+    for bit_pos in (0..4).rev() {
+        bits.push((tc_encoded >> bit_pos) & 1);
+    }
+    // chunk_len: 4 bits (encoded as value-1)
+    let cl_encoded = chunk_len.saturating_sub(1);
+    for bit_pos in (0..4).rev() {
+        bits.push((cl_encoded >> bit_pos) & 1);
+    }
+    // chunk data bytes
+    for &byte in &chunk.data {
         for bit_pos in (0..8).rev() {
             bits.push((byte >> bit_pos) & 1);
         }
     }
-    // Checksum: 8 bits
+    // checksum: 8 bits
     for bit_pos in (0..8).rev() {
         bits.push((checksum >> bit_pos) & 1);
     }
@@ -1206,18 +1246,18 @@ pub fn encode_chirp_url(url: &str, sample_rate: u32) -> Vec<f32> {
     samples
 }
 
-/// Decode a URL from a binary chirp audio burst using correlation.
+/// Decode a URL chunk from a binary chirp audio burst using correlation.
 ///
-/// Returns the decoded URL string, or `None` if no valid URL burst is found.
-pub fn decode_chirp_url(samples: &[f32], sample_rate: u32) -> Option<String> {
+/// Returns the decoded `UrlChunk`, or `None` if no valid chunk is found.
+pub fn decode_chirp_url_chunk(samples: &[f32], sample_rate: u32) -> Option<UrlChunk> {
     let up_template = data_up_chirp(sample_rate);
     let down_template = data_down_chirp(sample_rate);
     let chirp_len = up_template.len();
     let gap_samples = (DATA_CHIRP_GAP * sample_rate as f32) as usize;
     let slot_len = chirp_len + gap_samples;
 
-    // We need at least preamble(8) + sync(4) + url_len(8) + checksum(8) = 28 slots
-    let min_slots = 28;
+    // Minimum: preamble(8) + sync(4) + idx(4) + total(4) + len(4) + 1 byte(8) + checksum(8) = 40 slots
+    let min_slots = 40;
     if samples.len() < min_slots * slot_len / 2 {
         return None;
     }
@@ -1232,7 +1272,7 @@ pub fn decode_chirp_url(samples: &[f32], sample_rate: u32) -> Option<String> {
     let max_search = samples.len().saturating_sub(min_slots * slot_len).min(slot_len * 12);
 
     for start_offset in (0..=max_search).step_by(search_step) {
-        if let Some(result) = try_decode_url_at_offset(
+        if let Some(result) = try_decode_url_chunk_at_offset(
             samples, start_offset, &up_template, &down_template,
             up_energy, down_energy, slot_len, chirp_len,
         ) {
@@ -1243,8 +1283,8 @@ pub fn decode_chirp_url(samples: &[f32], sample_rate: u32) -> Option<String> {
     None
 }
 
-/// Try to decode a URL chirp message at a specific sample offset.
-fn try_decode_url_at_offset(
+/// Try to decode a URL chunk at a specific sample offset using correlation.
+fn try_decode_url_chunk_at_offset(
     samples: &[f32],
     start: usize,
     up_template: &[f32],
@@ -1253,9 +1293,9 @@ fn try_decode_url_at_offset(
     down_energy: f32,
     slot_len: usize,
     chirp_len: usize,
-) -> Option<String> {
-    // First decode preamble + sync + url_len = 20 bits
-    let header_bits = 20;
+) -> Option<UrlChunk> {
+    // Decode header: preamble(8) + sync(4) + chunk_index(4) + total_chunks(4) + chunk_len(4) = 24 bits
+    let header_bits = 24;
     if samples.len() < start + header_bits * slot_len {
         return None;
     }
@@ -1263,7 +1303,6 @@ fn try_decode_url_at_offset(
     let mut bits = Vec::new();
     let mut slot = 0;
 
-    // Decode header bits
     for _ in 0..header_bits {
         let offset = start + slot * slot_len;
         if offset + chirp_len > samples.len() {
@@ -1289,7 +1328,7 @@ fn try_decode_url_at_offset(
         slot += 1;
     }
 
-    // Verify URL preamble
+    // Verify URL preamble and sync
     if bits[0..8] != URL_PREAMBLE {
         return None;
     }
@@ -1297,13 +1336,22 @@ fn try_decode_url_at_offset(
         return None;
     }
 
-    let url_len = bits_to_byte(&bits[12..20]) as usize;
-    if url_len == 0 {
+    // Extract header fields (4 bits each)
+    let chunk_index = bits_to_nibble(&bits[12..16]);
+    let total_chunks_encoded = bits_to_nibble(&bits[16..20]);
+    let total_chunks = total_chunks_encoded + 1;
+    let chunk_len_encoded = bits_to_nibble(&bits[20..24]);
+    let chunk_len = (chunk_len_encoded + 1) as usize;
+
+    if chunk_len == 0 || chunk_len > CHUNK_SIZE {
+        return None;
+    }
+    if chunk_index >= total_chunks {
         return None;
     }
 
-    // Now decode url_bytes(url_len*8) + checksum(8) more bits
-    let remaining_bits = url_len * 8 + 8;
+    // Decode remaining: chunk_data(chunk_len*8) + checksum(8)
+    let remaining_bits = chunk_len * 8 + 8;
     let total_needed = start + (header_bits + remaining_bits) * slot_len;
     if samples.len() < total_needed {
         return None;
@@ -1334,38 +1382,42 @@ fn try_decode_url_at_offset(
         slot += 1;
     }
 
-    // Extract URL bytes and checksum
-    let data_start = 20; // after preamble + sync + url_len
-    let mut url_bytes = Vec::with_capacity(url_len);
-    for i in 0..url_len {
+    // Extract chunk data bytes and checksum
+    let data_start = 24;
+    let mut chunk_data = Vec::with_capacity(chunk_len);
+    for i in 0..chunk_len {
         let byte_start = data_start + i * 8;
-        url_bytes.push(bits_to_byte(&bits[byte_start..byte_start + 8]));
+        chunk_data.push(bits_to_byte(&bits[byte_start..byte_start + 8]));
     }
-    let checksum = bits_to_byte(&bits[data_start + url_len * 8..data_start + url_len * 8 + 8]);
+    let checksum = bits_to_byte(&bits[data_start + chunk_len * 8..data_start + chunk_len * 8 + 8]);
 
-    let mut expected_checksum = url_len as u8;
-    for &b in &url_bytes {
+    let meta_byte = chunk_index | (total_chunks_encoded << 4);
+    let mut expected_checksum = meta_byte ^ (chunk_len as u8);
+    for &b in &chunk_data {
         expected_checksum ^= b;
     }
     if checksum != expected_checksum {
         return None;
     }
 
-    String::from_utf8(url_bytes).ok()
+    Some(UrlChunk {
+        chunk_index,
+        total_chunks,
+        data: chunk_data,
+    })
 }
 
-/// Decode a URL from a binary chirp burst using spectrogram analysis.
+/// Decode a URL chunk from a binary chirp burst using spectrogram analysis.
 ///
-/// Like `decode_chirp_url` but uses spectrogram peak-frequency comparison
-/// (same technique as `decode_chirp_message_sweep`) for robustness through
-/// acoustic paths.
-pub fn decode_chirp_url_sweep(samples: &[f32], sample_rate: u32) -> Option<String> {
+/// Like `decode_chirp_url_chunk` but uses spectrogram peak-frequency comparison
+/// for robustness through acoustic paths.
+pub fn decode_chirp_url_chunk_sweep(samples: &[f32], sample_rate: u32) -> Option<UrlChunk> {
     let chirp_samples = (DATA_CHIRP_DURATION * sample_rate as f32) as usize;
     let gap_samples = (DATA_CHIRP_GAP * sample_rate as f32) as usize;
     let slot_samples = chirp_samples + gap_samples;
 
-    // Minimum: preamble(8) + sync(4) + url_len(8) + 1 byte(8) + checksum(8) = 36 slots
-    let min_bits = 36;
+    // Minimum: preamble(8) + sync(4) + idx(4) + total(4) + len(4) + 1 byte(8) + checksum(8) = 40 slots
+    let min_bits = 40;
     if samples.len() < min_bits * slot_samples / 2 {
         return None;
     }
@@ -1446,13 +1498,10 @@ pub fn decode_chirp_url_sweep(samples: &[f32], sample_rate: u32) -> Option<Strin
     }
 
     let search_step = (approx_frames_per_slot / 4).max(1);
-
-    // We need to try multiple start frames; for each, decode header first
-    // to learn url_len, then decode the rest.
     let max_search = actual_frames.saturating_sub(min_bits * approx_frames_per_slot);
 
     for start_frame in (0..=max_search).step_by(search_step) {
-        if let Some(result) = try_decode_url_sweep_at_frame(
+        if let Some(result) = try_decode_url_chunk_sweep_at_frame(
             &peak_freqs, start_frame, slot_samples, chirp_samples,
         ) {
             return Some(result);
@@ -1462,17 +1511,17 @@ pub fn decode_chirp_url_sweep(samples: &[f32], sample_rate: u32) -> Option<Strin
     None
 }
 
-/// Try to decode a URL chirp at a specific spectrogram frame offset.
-fn try_decode_url_sweep_at_frame(
+/// Try to decode a URL chunk at a specific spectrogram frame offset.
+fn try_decode_url_chunk_sweep_at_frame(
     peak_freqs: &[f32],
     start_frame: usize,
     slot_samples: usize,
     chirp_samples: usize,
-) -> Option<String> {
+) -> Option<UrlChunk> {
     let start_sample = start_frame * SWEEP_HOP_SIZE;
 
-    // First decode 20 header bits: preamble(8) + sync(4) + url_len(8)
-    let header_bits = 20;
+    // Decode header: preamble(8) + sync(4) + chunk_index(4) + total_chunks(4) + chunk_len(4) = 24 bits
+    let header_bits = 24;
     let mut bits = Vec::new();
 
     for i in 0..header_bits {
@@ -1494,7 +1543,7 @@ fn try_decode_url_sweep_at_frame(
         bits.push(if second_avg > first_avg { 1u8 } else { 0u8 });
     }
 
-    // Verify URL preamble
+    // Verify URL preamble and sync
     if bits[0..8] != URL_PREAMBLE {
         return None;
     }
@@ -1502,13 +1551,22 @@ fn try_decode_url_sweep_at_frame(
         return None;
     }
 
-    let url_len = bits_to_byte(&bits[12..20]) as usize;
-    if url_len == 0 {
+    // Extract header fields
+    let chunk_index = bits_to_nibble(&bits[12..16]);
+    let total_chunks_encoded = bits_to_nibble(&bits[16..20]);
+    let total_chunks = total_chunks_encoded + 1;
+    let chunk_len_encoded = bits_to_nibble(&bits[20..24]);
+    let chunk_len = (chunk_len_encoded + 1) as usize;
+
+    if chunk_len == 0 || chunk_len > CHUNK_SIZE {
+        return None;
+    }
+    if chunk_index >= total_chunks {
         return None;
     }
 
-    // Decode remaining: url_bytes(url_len*8) + checksum(8)
-    let remaining_bits = url_len * 8 + 8;
+    // Decode remaining: chunk_data(chunk_len*8) + checksum(8)
+    let remaining_bits = chunk_len * 8 + 8;
     let total_bits = header_bits + remaining_bits;
 
     for i in header_bits..total_bits {
@@ -1530,24 +1588,38 @@ fn try_decode_url_sweep_at_frame(
         bits.push(if second_avg > first_avg { 1u8 } else { 0u8 });
     }
 
-    // Extract URL bytes and checksum
-    let data_start = 20;
-    let mut url_bytes = Vec::with_capacity(url_len);
-    for i in 0..url_len {
+    // Extract chunk data bytes and checksum
+    let data_start = 24;
+    let mut chunk_data = Vec::with_capacity(chunk_len);
+    for i in 0..chunk_len {
         let byte_start = data_start + i * 8;
-        url_bytes.push(bits_to_byte(&bits[byte_start..byte_start + 8]));
+        chunk_data.push(bits_to_byte(&bits[byte_start..byte_start + 8]));
     }
-    let checksum = bits_to_byte(&bits[data_start + url_len * 8..data_start + url_len * 8 + 8]);
+    let checksum = bits_to_byte(&bits[data_start + chunk_len * 8..data_start + chunk_len * 8 + 8]);
 
-    let mut expected_checksum = url_len as u8;
-    for &b in &url_bytes {
+    let meta_byte = chunk_index | (total_chunks_encoded << 4);
+    let mut expected_checksum = meta_byte ^ (chunk_len as u8);
+    for &b in &chunk_data {
         expected_checksum ^= b;
     }
     if checksum != expected_checksum {
         return None;
     }
 
-    String::from_utf8(url_bytes).ok()
+    Some(UrlChunk {
+        chunk_index,
+        total_chunks,
+        data: chunk_data,
+    })
+}
+
+/// Extract a 4-bit nibble from a slice of bit values.
+fn bits_to_nibble(bits: &[u8]) -> u8 {
+    let mut val = 0u8;
+    for (i, &bit) in bits.iter().enumerate() {
+        val |= bit << (3 - i);
+    }
+    val
 }
 
 #[cfg(test)]
@@ -2205,75 +2277,76 @@ mod tests {
         assert!(result.is_some(), "Should detect chirp in padded signal");
     }
 
-    // --- URL chirp messaging tests ---
+    // --- URL chunk chirp messaging tests ---
 
     #[test]
-    fn test_url_chirp_roundtrip() {
-        let url = "https://apisandbox.openbankproject.com";
-        let samples = encode_chirp_url(url, SAMPLE_RATE);
+    fn test_url_chunk_roundtrip() {
+        let chunk = UrlChunk {
+            chunk_index: 0,
+            total_chunks: 4,
+            data: b"https:".to_vec(),
+        };
+        let samples = encode_chirp_url_chunk(&chunk, SAMPLE_RATE);
         assert!(!samples.is_empty());
 
-        let result = decode_chirp_url(&samples, SAMPLE_RATE);
-        assert_eq!(result.as_deref(), Some(url), "URL roundtrip decode should match");
+        let result = decode_chirp_url_chunk(&samples, SAMPLE_RATE);
+        assert_eq!(result, Some(chunk), "Chunk correlation roundtrip should match");
     }
 
     #[test]
-    fn test_url_chirp_sweep_roundtrip() {
+    fn test_url_chunk_sweep_roundtrip() {
+        let chunk = UrlChunk {
+            chunk_index: 2,
+            total_chunks: 5,
+            data: b"//api.".to_vec(),
+        };
+        let samples = encode_chirp_url_chunk(&chunk, SAMPLE_RATE);
+
+        let result = decode_chirp_url_chunk_sweep(&samples, SAMPLE_RATE);
+        assert_eq!(result, Some(chunk), "Chunk sweep roundtrip should match");
+    }
+
+    #[test]
+    fn test_url_chunk_split_reassemble() {
         let url = "https://apisandbox.openbankproject.com";
-        let samples = encode_chirp_url(url, SAMPLE_RATE);
+        let chunks = split_url_into_chunks(url);
+        assert_eq!(chunks.len(), (url.len() + CHUNK_SIZE - 1) / CHUNK_SIZE);
 
-        let result = decode_chirp_url_sweep(&samples, SAMPLE_RATE);
-        assert_eq!(result.as_deref(), Some(url), "URL sweep roundtrip decode should match");
-    }
+        // Encode, decode, and reassemble all chunks
+        let mut received: Vec<Option<Vec<u8>>> = vec![None; chunks.len()];
+        for chunk in &chunks {
+            let samples = encode_chirp_url_chunk(chunk, SAMPLE_RATE);
+            let decoded = decode_chirp_url_chunk(&samples, SAMPLE_RATE)
+                .expect("Each chunk should decode");
+            assert_eq!(decoded.chunk_index, chunk.chunk_index);
+            assert_eq!(decoded.total_chunks as usize, chunks.len());
+            received[decoded.chunk_index as usize] = Some(decoded.data);
+        }
 
-    #[test]
-    fn test_url_chirp_with_leading_silence() {
-        let url = "https://example.com/obp";
-        let msg = encode_chirp_url(url, SAMPLE_RATE);
-
-        let mut padded = vec![0.0f32; SAMPLE_RATE as usize]; // 1 second of silence
-        padded.extend_from_slice(&msg);
-
-        let result = decode_chirp_url_sweep(&padded, SAMPLE_RATE);
-        assert_eq!(result.as_deref(), Some(url), "URL sweep decode should work with leading silence");
-    }
-
-    #[test]
-    fn test_url_chirp_with_noise() {
-        let url = "https://test.openbankproject.com";
-        let samples = encode_chirp_url(url, SAMPLE_RATE);
-
-        let noisy: Vec<f32> = samples
-            .iter()
-            .enumerate()
-            .map(|(i, &s)| {
-                let noise = (i as f32 * 7.3).sin() * 0.05;
-                s + noise
-            })
+        // Reassemble
+        let reassembled: Vec<u8> = received.into_iter()
+            .map(|slot| slot.expect("All slots should be filled"))
+            .flatten()
             .collect();
-
-        let result = decode_chirp_url(&noisy, SAMPLE_RATE);
-        assert_eq!(result.as_deref(), Some(url), "URL decode should work with mild noise");
+        let result = String::from_utf8(reassembled).expect("Should be valid UTF-8");
+        assert_eq!(result, url, "Reassembled URL should match original");
     }
 
     #[test]
-    fn test_url_chirp_not_confused_with_hello() {
-        // A hello message should NOT decode as a URL
+    fn test_url_chunk_isolation_from_hello() {
+        // A hello message should NOT decode as a URL chunk
         let hello_samples = encode_chirp_message(7312, 0x0B, 10, SAMPLE_RATE);
-        let result = decode_chirp_url(&hello_samples, SAMPLE_RATE);
-        assert!(result.is_none(), "Hello message should not decode as URL");
+        let result = decode_chirp_url_chunk(&hello_samples, SAMPLE_RATE);
+        assert!(result.is_none(), "Hello message should not decode as URL chunk");
 
-        // A URL message should NOT decode as a hello
-        let url_samples = encode_chirp_url("https://example.com", SAMPLE_RATE);
-        let result = decode_chirp_message(&url_samples, SAMPLE_RATE);
-        assert!(result.is_none(), "URL message should not decode as hello");
-    }
-
-    #[test]
-    fn test_url_chirp_short_url() {
-        let url = "http://x.co";
-        let samples = encode_chirp_url(url, SAMPLE_RATE);
-        let result = decode_chirp_url(&samples, SAMPLE_RATE);
-        assert_eq!(result.as_deref(), Some(url));
+        // A URL chunk should NOT decode as a hello
+        let chunk = UrlChunk {
+            chunk_index: 0,
+            total_chunks: 1,
+            data: b"http:/".to_vec(),
+        };
+        let chunk_samples = encode_chirp_url_chunk(&chunk, SAMPLE_RATE);
+        let result = decode_chirp_message(&chunk_samples, SAMPLE_RATE);
+        assert!(result.is_none(), "URL chunk should not decode as hello");
     }
 }

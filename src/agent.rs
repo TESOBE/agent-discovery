@@ -35,7 +35,7 @@ pub enum AgentMood {
     /// Connected to exactly one other agent.
     Happy = 2,
     /// Connected to exactly two other agents.
-    VeryHappy = 3,
+    Coffee = 3,
     /// Connected to three or more other agents.
     Party = 4,
 }
@@ -46,7 +46,7 @@ impl AgentMood {
             0 => Self::Struggling,
             1 => Self::Lonely,
             2 => Self::Happy,
-            3 => Self::VeryHappy,
+            3 => Self::Coffee,
             4 => Self::Party,
             _ => Self::Party,
         }
@@ -58,7 +58,7 @@ impl AgentMood {
             Self::Struggling => "Struggling",
             Self::Lonely => "Lonely",
             Self::Happy => "Happy",
-            Self::VeryHappy => "Very Happy",
+            Self::Coffee => "Coffee",
             Self::Party => "Party!",
         }
     }
@@ -68,7 +68,7 @@ impl AgentMood {
         match count {
             0 => Self::Lonely,
             1 => Self::Happy,
-            2 => Self::VeryHappy,
+            2 => Self::Coffee,
             _ => Self::Party,
         }
     }
@@ -1842,6 +1842,7 @@ async fn run_announce_loop(
     let mut announce_count: u64 = 0;
     let mut minutes_between_hellos: u64 = 1; // every minute initially
     let mut made_contact = false;
+    let mut url_chunk_index: usize = 0;
 
     loop {
         // Wait until our designated second within the minute
@@ -1923,16 +1924,19 @@ async fn run_announce_loop(
         samples_to_send.extend_from_slice(&section_gap);
         samples_to_send.extend_from_slice(&binary_msg);
 
-        // Append URL chirp burst if OBP URL is configured
+        // Append one URL chunk per hello cycle if OBP URL is configured
         if !obp_url.is_empty() {
-            let url_chirp = chirp::encode_chirp_url(&obp_url, sample_rate);
-            let url_duration = url_chirp.len() as f32 / sample_rate as f32;
+            let chunks = chirp::split_url_into_chunks(&obp_url);
+            let chunk = &chunks[url_chunk_index % chunks.len()];
+            let chunk_chirp = chirp::encode_chirp_url_chunk(chunk, sample_rate);
+            let chunk_duration = chunk_chirp.len() as f32 / sample_rate as f32;
             tracing::info!(
-                "TX: Sending OBP URL chirp ({} bytes, ~{:.1}s)",
-                obp_url.len(), url_duration
+                "TX: Sending URL chunk {}/{} (~{:.1}s)",
+                chunk.chunk_index + 1, chunk.total_chunks, chunk_duration
             );
             samples_to_send.extend_from_slice(&section_gap);
-            samples_to_send.extend_from_slice(&url_chirp);
+            samples_to_send.extend_from_slice(&chunk_chirp);
+            url_chunk_index += 1;
         }
 
         let total_duration_secs = samples_to_send.len() as f32 / sample_rate as f32;
@@ -2073,18 +2077,6 @@ async fn run_receive_loop(
                     address, port, caps, caps_desc, next_hello_mins
                 );
 
-                // Try to decode an optional URL chirp burst from the remaining buffer
-                let peer_obp_url = match chirp::decode_chirp_url_sweep(&sample_buffer, sample_rate) {
-                    Some(url) => {
-                        tracing::info!("RX: Decoded OBP URL chirp from peer: {}", url);
-                        url
-                    }
-                    None => {
-                        tracing::debug!("RX: No URL chirp burst found (peer may not have one)");
-                        String::new()
-                    }
-                };
-
                 // Register the peer with its advertised hello interval
                 let pseudo_id = {
                     let mut bytes = [0u8; 16];
@@ -2103,20 +2095,32 @@ async fn run_receive_loop(
                         crate::protocol::message::Capabilities(caps),
                         next_hello_mins,
                     );
-                    if !peer_obp_url.is_empty() {
-                        peer.obp_api_base_url = peer_obp_url;
-                    }
                 } else {
                     let msg = crate::protocol::message::DiscoveryMessage::announce(
                         pseudo_id,
                         &address,
                         crate::protocol::message::Capabilities(caps),
-                        &peer_obp_url,
+                        "",
                     );
                     mgr.handle_message(&msg);
                     // Set next_hello_mins on the newly added peer
                     if let Some(peer) = mgr.peers_mut().get_mut(&pseudo_id) {
                         peer.next_hello_mins = next_hello_mins;
+                    }
+                }
+
+                // Try to decode an optional URL chunk from the buffer
+                if let Some(chunk) = chirp::decode_chirp_url_chunk_sweep(&sample_buffer, sample_rate) {
+                    tracing::info!(
+                        "RX: Got URL chunk {}/{}",
+                        chunk.chunk_index + 1, chunk.total_chunks
+                    );
+                    if let Some(peer) = mgr.peers_mut().get_mut(&pseudo_id) {
+                        peer.receive_url_chunk(&chunk);
+                        if let Some(url) = peer.try_assemble_url() {
+                            tracing::info!("RX: URL complete: {}", url);
+                            peer.obp_api_base_url = url;
+                        }
                     }
                 }
                 peer_found.store(true, Ordering::Release);

@@ -1,5 +1,6 @@
 /// Peer data structure and timeout tracking.
 
+use crate::audio::chirp::UrlChunk;
 use crate::protocol::message::Capabilities;
 use std::time::Instant;
 use uuid::Uuid;
@@ -23,6 +24,10 @@ pub struct Peer {
     pub next_hello_mins: u8,
     /// The OBP API base URL this peer uses (empty if unknown).
     pub obp_api_base_url: String,
+    /// Accumulator for URL chunks arriving over multiple hello cycles.
+    /// `None` = no chunks arriving yet.
+    /// `Some(vec)` = vec of length `total_chunks`, each slot `None` or `Some(data)`.
+    pub url_chunks: Option<Vec<Option<Vec<u8>>>>,
 }
 
 impl Peer {
@@ -36,7 +41,47 @@ impl Peer {
             last_seen: now,
             next_hello_mins: 0,
             obp_api_base_url,
+            url_chunks: None,
         }
+    }
+
+    /// Insert a received URL chunk into the accumulator.
+    ///
+    /// Initializes the accumulator on the first chunk. Resets if `total_chunks`
+    /// changes (URL changed on the peer side).
+    pub fn receive_url_chunk(&mut self, chunk: &UrlChunk) {
+        let total = chunk.total_chunks as usize;
+        let idx = chunk.chunk_index as usize;
+
+        // Reset if total_chunks changed (peer URL changed)
+        if let Some(ref slots) = self.url_chunks {
+            if slots.len() != total {
+                self.url_chunks = None;
+            }
+        }
+
+        // Initialize if needed
+        if self.url_chunks.is_none() {
+            self.url_chunks = Some(vec![None; total]);
+        }
+
+        if let Some(ref mut slots) = self.url_chunks {
+            if idx < slots.len() {
+                slots[idx] = Some(chunk.data.clone());
+            }
+        }
+    }
+
+    /// Try to assemble the full URL from accumulated chunks.
+    ///
+    /// Returns `Some(url)` if all chunk slots are filled and the result is valid UTF-8.
+    pub fn try_assemble_url(&self) -> Option<String> {
+        let slots = self.url_chunks.as_ref()?;
+        let mut all_bytes = Vec::new();
+        for slot in slots {
+            all_bytes.extend_from_slice(slot.as_ref()?);
+        }
+        String::from_utf8(all_bytes).ok()
     }
 
     /// Update the last_seen timestamp and optionally the address/capabilities.
