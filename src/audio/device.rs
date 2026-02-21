@@ -501,6 +501,20 @@ pub async fn diagnose_audio_to_signal(config: &Config) -> Result<()> {
 /// Tries cpal first (works on desktop). If cpal fails (common on Pi with
 /// USB audio), falls back to spawning `aplay`/`arecord` subprocesses which
 /// use ALSA read/write mode and work reliably with USB devices.
+///
+/// TODO: Add a self-discovery / self-test mode. On startup, the engine should
+/// play a short known tone through the speaker and simultaneously listen on
+/// the mic. If the mic picks up the tone (RMS above a threshold), the current
+/// audio config is working. If not, try the next config in a ranked list:
+///   1. subprocess aplay/arecord at 44100Hz mono
+///   2. subprocess at 48000Hz mono
+///   3. subprocess at 48000Hz stereo
+///   4. cpal with I16 format
+///   5. cpal with F32 format
+///   6. cpal with different device indices (enumerate all output/input pairs)
+/// Once a working config is found, persist it (e.g. to a local file) so
+/// subsequent startups skip the probing. Log the result to the OBP
+/// audio-diagnostics signal channel for remote visibility.
 pub struct AudioEngine {
     tx_sender: Sender<Vec<f32>>,
     rx_receiver: Receiver<Vec<f32>>,

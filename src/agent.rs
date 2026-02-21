@@ -125,7 +125,41 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
             Some(Arc::new(engine))
         }
         Err(e) => {
-            tracing::warn!("Audio engine unavailable: {}. Running in discovery-only mode.", e);
+            let error_msg = format!("{}", e);
+            tracing::warn!("Audio engine unavailable: {}. Running in discovery-only mode.", error_msg);
+
+            // Post a help request to the signal channel so other agents
+            // (or humans monitoring) can see this agent needs audio help.
+            if let Some(ref obp) = obp_client {
+                let help_payload = serde_json::json!({
+                    "payload": {
+                        "agent_name": config.agent_name,
+                        "type": "audio-help-needed",
+                        "error": error_msg,
+                        "message": format!(
+                            "Agent '{}' cannot initialise audio: {}. \
+                             Running in discovery-only mode (UDP). \
+                             Needs help configuring audio devices.",
+                            config.agent_name, error_msg
+                        ),
+                        "mac_address": get_mac_address(),
+                        "timestamp": crate::obp::entities::iso_now(),
+                    }
+                });
+                let path = format!(
+                    "/obp/{}/signal/channels/agent-help/messages",
+                    crate::obp::client::API_VERSION
+                );
+                tracing::info!(
+                    "Signal POST {}{} — requesting audio help",
+                    obp.base_url(), path
+                );
+                match obp.post(&path, &help_payload).await {
+                    Ok(val) => tracing::info!("Posted audio help request to signal channel: {}", val),
+                    Err(post_err) => tracing::warn!("Failed to post help request: {}", post_err),
+                }
+            }
+
             None
         }
     };
@@ -1477,7 +1511,27 @@ fn known_signal_endpoints() -> Vec<crate::obp::exploration::DiscoveredEndpoint> 
     ]
 }
 
-/// Publish a test message to an OBP signal channel via direct HTTP POST.
+/// Get the MAC address of the first non-loopback network interface.
+/// Returns a string like "aa:bb:cc:dd:ee:ff" or "unknown".
+fn get_mac_address() -> String {
+    // Read from /sys/class/net on Linux
+    if let Ok(entries) = std::fs::read_dir("/sys/class/net") {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "lo" { continue; } // skip loopback
+            let path = format!("/sys/class/net/{}/address", name);
+            if let Ok(mac) = std::fs::read_to_string(&path) {
+                let mac = mac.trim().to_string();
+                if !mac.is_empty() && mac != "00:00:00:00:00:00" {
+                    return mac;
+                }
+            }
+        }
+    }
+    "unknown".into()
+}
+
+/// Publish a message to an OBP signal channel via direct HTTP POST.
 async fn publish_signal_message_via_http(
     obp: &ObpClient,
     channel_name: &str,
@@ -1488,7 +1542,18 @@ async fn publish_signal_message_via_http(
         crate::obp::client::API_VERSION,
         channel_name
     );
-    obp.post(&path, payload).await
+    tracing::info!(
+        channel = channel_name,
+        "Signal POST {}{} payload={}",
+        obp.base_url(), path, payload
+    );
+    let response = obp.post(&path, payload).await?;
+    tracing::info!(
+        channel = channel_name,
+        "Signal POST response: {}",
+        response
+    );
+    Ok(response)
 }
 
 /// Read messages from an OBP signal channel via direct HTTP GET.
@@ -1501,7 +1566,23 @@ async fn read_signal_messages_via_http(
         crate::obp::client::API_VERSION,
         channel_name
     );
-    obp.get(&path).await
+    tracing::info!(
+        channel = channel_name,
+        "Signal GET {}{}",
+        obp.base_url(), path
+    );
+    let response = obp.get(&path).await?;
+    let msg_count = response.get("messages")
+        .and_then(|m| m.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    tracing::info!(
+        channel = channel_name,
+        count = msg_count,
+        "Signal GET response: {} message(s): {}",
+        msg_count, response
+    );
+    Ok(response)
 }
 
 /// Back-off parameters for the UDP announce loop.
