@@ -48,6 +48,8 @@ enum Commands {
     },
     /// Play a tone and try to decode it from the mic (tests the acoustic path)
     TestRoundtrip,
+    /// Post audio device diagnostics to OBP signal channel 'audio-diagnostics'
+    DiagnoseAudio,
 }
 
 #[tokio::main]
@@ -105,6 +107,9 @@ async fn main() -> Result<()> {
         }
         Commands::TestRoundtrip => {
             audio::device::test_roundtrip()?;
+        }
+        Commands::DiagnoseAudio => {
+            audio::device::diagnose_audio_to_signal(&config).await?;
         }
     }
 

@@ -409,6 +409,93 @@ fn smooth_envelope(i: usize, total: usize) -> f32 {
     }
 }
 
+/// Collect audio device info and post it to OBP signal channel 'audio-diagnostics'.
+pub async fn diagnose_audio_to_signal(config: &Config) -> Result<()> {
+    let host = cpal::default_host();
+    let mut info = String::new();
+
+    info.push_str(&format!("host: {:?}\n", host.id()));
+
+    if let Some(dev) = host.default_output_device() {
+        let name = dev.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "?".into());
+        info.push_str(&format!("default_output: {}\n", name));
+        if let Ok(cfg) = dev.default_output_config() {
+            info.push_str(&format!("  config: ch={} rate={} fmt={:?}\n", cfg.channels(), cfg.sample_rate(), cfg.sample_format()));
+        }
+    } else {
+        info.push_str("default_output: NONE\n");
+    }
+
+    if let Some(dev) = host.default_input_device() {
+        let name = dev.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "?".into());
+        info.push_str(&format!("default_input: {}\n", name));
+        if let Ok(cfg) = dev.default_input_config() {
+            info.push_str(&format!("  config: ch={} rate={} fmt={:?}\n", cfg.channels(), cfg.sample_rate(), cfg.sample_format()));
+        }
+    } else {
+        info.push_str("default_input: NONE\n");
+    }
+
+    info.push_str("\nall_outputs:\n");
+    if let Ok(devices) = host.output_devices() {
+        for (i, device) in devices.enumerate() {
+            let name = device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "?".into());
+            info.push_str(&format!("  [{}] {}\n", i, name));
+            if let Ok(cfg) = device.default_output_config() {
+                info.push_str(&format!("    default: ch={} rate={} fmt={:?}\n", cfg.channels(), cfg.sample_rate(), cfg.sample_format()));
+            }
+            if let Ok(configs) = device.supported_output_configs() {
+                for cfg in configs {
+                    info.push_str(&format!("    supported: ch={} rate={}-{} fmt={:?}\n",
+                        cfg.channels(), cfg.min_sample_rate(), cfg.max_sample_rate(), cfg.sample_format()));
+                }
+            }
+        }
+    }
+
+    info.push_str("\nall_inputs:\n");
+    if let Ok(devices) = host.input_devices() {
+        for (i, device) in devices.enumerate() {
+            let name = device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "?".into());
+            info.push_str(&format!("  [{}] {}\n", i, name));
+            if let Ok(cfg) = device.default_input_config() {
+                info.push_str(&format!("    default: ch={} rate={} fmt={:?}\n", cfg.channels(), cfg.sample_rate(), cfg.sample_format()));
+            }
+            if let Ok(configs) = device.supported_input_configs() {
+                for cfg in configs {
+                    info.push_str(&format!("    supported: ch={} rate={}-{} fmt={:?}\n",
+                        cfg.channels(), cfg.min_sample_rate(), cfg.max_sample_rate(), cfg.sample_format()));
+                }
+            }
+        }
+    }
+
+    println!("{}", info);
+
+    // Post to OBP signal channel
+    let mut obp = crate::obp::client::ObpClient::new(config);
+    match obp.authenticate().await {
+        Ok(()) => {
+            let payload = serde_json::json!({
+                "payload": {
+                    "agent_name": config.agent_name,
+                    "type": "audio-diagnostics",
+                    "info": info,
+                }
+            });
+            let path = format!("/obp/{}/signal/channels/audio-diagnostics/messages",
+                crate::obp::client::API_VERSION);
+            match obp.post(&path, &payload).await {
+                Ok(val) => println!("Posted to signal channel: {}", val),
+                Err(e) => println!("Failed to post to signal channel: {}", e),
+            }
+        }
+        Err(e) => println!("OBP auth failed (skipping signal post): {}", e),
+    }
+
+    Ok(())
+}
+
 /// AudioEngine manages sending and receiving FSK-modulated audio via cpal.
 pub struct AudioEngine {
     tx_sender: Sender<Vec<f32>>,
