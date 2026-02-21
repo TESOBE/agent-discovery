@@ -1,6 +1,6 @@
 /// Agent orchestrator: ties audio, discovery, negotiation, and OBP together.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use anyhow::Result;
@@ -296,6 +296,8 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
     let peer_found = Arc::new(AtomicBool::new(false));
     // Set to true after a handshake completes — slows down announce interval
     let handshake_done = Arc::new(AtomicBool::new(false));
+    // Audio energy level measured by RX loop — TX reads this for carrier-sense
+    let channel_energy = Arc::new(AtomicU32::new(0));
 
     // Start audio loops (skipped with --udp)
     if !udp_only {
@@ -308,8 +310,9 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
             let hs_flag = handshake_done.clone();
             let sig = chirp_sig.clone();
             let name = agent_name.clone();
+            let ce_flag = channel_energy.clone();
             tokio::spawn(
-                run_announce_loop(mgr, eng, tx_flag, pf_flag, hs_flag, sig, name)
+                run_announce_loop(mgr, eng, tx_flag, pf_flag, hs_flag, sig, name, ce_flag)
                     .instrument(agent_span.clone()),
             );
         }
@@ -320,8 +323,9 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
             let eng = engine.clone();
             let tx_flag = is_transmitting.clone();
             let pf_flag = peer_found.clone();
+            let ce_flag = channel_energy.clone();
             tokio::spawn(
-                run_receive_loop(mgr, eng, tx_flag, pf_flag, actual_port)
+                run_receive_loop(mgr, eng, tx_flag, pf_flag, actual_port, ce_flag)
                     .instrument(agent_span.clone()),
             );
         }
@@ -1851,6 +1855,7 @@ async fn run_announce_loop(
     handshake_done: Arc<AtomicBool>,
     chirp_sig: crate::audio::chirp::AgentChirpSignature,
     agent_name: String,
+    channel_energy: Arc<AtomicU32>,
 ) {
     use crate::audio::chirp;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -1978,6 +1983,30 @@ async fn run_announce_loop(
             my_second, port, caps, caps_desc
         );
 
+        // Carrier-sense: back off if another agent is chirping
+        const CS_THRESHOLD: f32 = 0.02; // ~2% amplitude, well above noise floor
+        const CS_MAX_RETRIES: u32 = 5;
+        const CS_RETRY_MS: u64 = 2000;
+
+        for retry in 0..CS_MAX_RETRIES {
+            let energy = channel_energy.load(Ordering::Acquire) as f32 / 10000.0;
+            if energy < CS_THRESHOLD {
+                break;
+            }
+            if retry == 0 {
+                tracing::info!(
+                    energy = format!("{:.4}", energy),
+                    "TX: Channel busy (energy {:.4} > {:.4}), backing off",
+                    energy, CS_THRESHOLD
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(CS_RETRY_MS)).await;
+            if retry == CS_MAX_RETRIES - 1 {
+                tracing::warn!("TX: Channel still busy after {}s, transmitting anyway",
+                    CS_MAX_RETRIES as u64 * CS_RETRY_MS / 1000);
+            }
+        }
+
         // Mute RX while transmitting so the mic doesn't pick up our own signal
         is_transmitting.store(true, Ordering::Release);
 
@@ -2007,6 +2036,7 @@ async fn run_receive_loop(
     is_transmitting: Arc<AtomicBool>,
     peer_found: Arc<AtomicBool>,
     own_port: u16,
+    channel_energy: Arc<AtomicU32>,
 ) {
     use crate::audio::chirp;
 
@@ -2020,6 +2050,10 @@ async fn run_receive_loop(
     // Post-TX cooldown: suppress decoding for 300ms after own TX finishes
     let mut post_tx_cooldown = std::time::Instant::now() - std::time::Duration::from_secs(10);
     let mut was_transmitting = false;
+
+    // Carrier-sense: track channel energy for the TX loop
+    let mut cs_peak: f32 = 0.0;
+    let mut last_cs_update = std::time::Instant::now();
 
     // Minimum buffer: a binary chirp message is 52 × 100ms ≈ 5.2s
     let min_msg_samples = (sample_rate as f32 * 5.0) as usize;
@@ -2040,7 +2074,21 @@ async fn run_receive_loop(
             }
             if !is_transmitting.load(Ordering::Acquire) {
                 sample_buffer.extend_from_slice(&chunk);
+                // Track carrier-sense peak from incoming audio (only when we're not TX)
+                for &s in &chunk {
+                    let abs = s.abs();
+                    if abs > cs_peak {
+                        cs_peak = abs;
+                    }
+                }
             }
+        }
+
+        // Publish carrier-sense energy and decay every 200ms
+        if last_cs_update.elapsed() >= std::time::Duration::from_millis(200) {
+            channel_energy.store((cs_peak * 10000.0) as u32, Ordering::Release);
+            cs_peak *= 0.3; // decay so stale values don't persist
+            last_cs_update = std::time::Instant::now();
         }
 
         // Log audio stats every 10 seconds
