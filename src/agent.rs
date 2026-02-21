@@ -1600,10 +1600,10 @@ async fn run_announce_loop(
             60 - current_second + my_second
         };
 
-        // Also account for minutes_between_hellos: skip minutes if slowing down
+        // First hello: broadcast immediately so we're audible on startup.
+        // Subsequent hellos: wait for our designated second within the minute.
         let total_wait = if announce_count == 0 {
-            // First hello: just wait for our second
-            wait_secs as u64
+            0
         } else {
             // Wait for (minutes_between_hellos - 1) full minutes + wait_secs
             (minutes_between_hellos - 1) * 60 + wait_secs as u64

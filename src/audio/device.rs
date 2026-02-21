@@ -496,72 +496,69 @@ pub async fn diagnose_audio_to_signal(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// AudioEngine manages sending and receiving FSK-modulated audio via cpal.
+/// AudioEngine manages sending and receiving FSK-modulated audio.
+///
+/// Tries cpal first (works on desktop). If cpal fails (common on Pi with
+/// USB audio), falls back to spawning `aplay`/`arecord` subprocesses which
+/// use ALSA read/write mode and work reliably with USB devices.
 pub struct AudioEngine {
     tx_sender: Sender<Vec<f32>>,
     rx_receiver: Receiver<Vec<f32>>,
-    _output_stream: cpal::Stream,
-    _input_stream: cpal::Stream,
+    // Hold onto resources so they aren't dropped:
+    _backend: AudioBackend,
 }
 
-/// Standard audio rates to try, in preference order.
-const PREFERRED_RATES: &[u32] = &[48000, 44100, 96000, 32000, 16000];
-
-/// Pick a sensible sample rate from a supported range.
-/// The ALSA plughw wrapper often claims to support 1–384000 Hz, so
-/// `with_max_sample_rate()` would pick something absurd. Instead we
-/// choose the first standard rate that falls within the range.
-fn pick_rate(range: &cpal::SupportedStreamConfigRange) -> u32 {
-    let min = range.min_sample_rate();
-    let max = range.max_sample_rate();
-    for &rate in PREFERRED_RATES {
-        if rate >= min && rate <= max {
-            return rate;
-        }
-    }
-    max
+enum AudioBackend {
+    Cpal {
+        _output_stream: cpal::Stream,
+        _input_stream: cpal::Stream,
+    },
+    Subprocess {
+        _output_child: std::process::Child,
+        _input_child: std::process::Child,
+        _output_thread: Option<std::thread::JoinHandle<()>>,
+        _input_thread: Option<std::thread::JoinHandle<()>>,
+    },
 }
 
-/// Find the best supported config for an output device.
-/// Prefers I16 (works on USB hardware). Returns (channels, sample_rate, format).
-fn best_output_config(device: &cpal::Device) -> Result<(u16, u32, cpal::SampleFormat)> {
-    // First look for an I16 config (USB hardware native format)
-    if let Ok(configs) = device.supported_output_configs() {
-        for range in configs {
-            if range.sample_format() == cpal::SampleFormat::I16 {
-                let rate = pick_rate(&range);
-                return Ok((range.channels(), rate, cpal::SampleFormat::I16));
-            }
-        }
-    }
-    // Fall back to default config
-    let default = device.default_output_config()
-        .context("No default output config")?;
-    Ok((default.channels(), default.sample_rate(), default.sample_format()))
-}
-
-fn best_input_config(device: &cpal::Device) -> Result<(u16, u32, cpal::SampleFormat)> {
-    if let Ok(configs) = device.supported_input_configs() {
-        for range in configs {
-            if range.sample_format() == cpal::SampleFormat::I16 {
-                let rate = pick_rate(&range);
-                return Ok((range.channels(), rate, cpal::SampleFormat::I16));
-            }
-        }
-    }
-    let default = device.default_input_config()
-        .context("No default input config")?;
-    Ok((default.channels(), default.sample_rate(), default.sample_format()))
-}
+/// The sample rate used by the subprocess backend.
+/// Matches modulator::SAMPLE_RATE so no resampling is needed.
+const SUBPROCESS_RATE: u32 = 44100;
 
 impl AudioEngine {
-    /// Create a new AudioEngine using the default audio devices.
+    /// Create a new AudioEngine.
     ///
-    /// Probes each device's supported configs and prefers I16 format at
-    /// the device's native sample rate. This avoids the common Pi problem
-    /// where the ALSA default wrapper falsely advertises F32 support but
-    /// the underlying USB hardware only handles I16 at a specific rate.
+    /// On Linux, tries aplay/arecord subprocesses first — these use ALSA
+    /// read/write mode which works reliably with USB audio on Pi (cpal uses
+    /// MMAP mode which causes POLLERR on USB devices).
+    /// On other platforms, uses cpal directly.
     pub fn new() -> Result<Self> {
+        #[cfg(target_os = "linux")]
+        {
+            match Self::try_subprocess() {
+                Ok(engine) => {
+                    tracing::info!("Audio engine: using aplay/arecord subprocess backend");
+                    return Ok(engine);
+                }
+                Err(sub_err) => {
+                    tracing::warn!("Subprocess backend failed: {}. Trying cpal.", sub_err);
+                }
+            }
+        }
+
+        match Self::try_cpal() {
+            Ok(engine) => {
+                tracing::info!("Audio engine: using cpal backend");
+                Ok(engine)
+            }
+            Err(cpal_err) => {
+                anyhow::bail!("No audio backend available: {}", cpal_err);
+            }
+        }
+    }
+
+    /// Try to create an engine using cpal.
+    fn try_cpal() -> Result<Self> {
         let host = cpal::default_host();
 
         let output_device = host.default_output_device()
@@ -571,14 +568,20 @@ impl AudioEngine {
 
         let out_name = output_device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "Unknown".into());
         let in_name = input_device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "Unknown".into());
-        tracing::info!("Audio output device: {}", out_name);
-        tracing::info!("Audio input device: {}", in_name);
+        tracing::info!("cpal output device: {}", out_name);
+        tracing::info!("cpal input device: {}", in_name);
 
-        // Find the best config for each device — prefers I16 at the
-        // hardware's native rate, which avoids ALSA EINVAL errors on Pi
-        // USB devices that can't actually do F32 or non-native rates.
-        let (out_channels, out_rate, out_fmt) = best_output_config(&output_device)?;
-        let (in_channels, in_rate, in_fmt) = best_input_config(&input_device)?;
+        let out_default = output_device.default_output_config()
+            .context("No default output config")?;
+        let in_default = input_device.default_input_config()
+            .context("No default input config")?;
+
+        let out_channels = out_default.channels();
+        let in_channels = in_default.channels();
+        let out_rate = out_default.sample_rate();
+        let in_rate = in_default.sample_rate();
+        let out_fmt = out_default.sample_format();
+        let in_fmt = in_default.sample_format();
 
         let out_config = cpal::StreamConfig {
             channels: out_channels,
@@ -590,96 +593,48 @@ impl AudioEngine {
             sample_rate: in_rate,
             buffer_size: cpal::BufferSize::Default,
         };
-        tracing::info!("Output stream: {}ch @ {:?} fmt={:?}", out_channels, out_rate, out_fmt);
-        tracing::info!("Input stream: {}ch @ {:?} fmt={:?}", in_channels, in_rate, in_fmt);
+        tracing::info!("cpal output: {}ch @ {}Hz fmt={:?}", out_channels, out_rate, out_fmt);
+        tracing::info!("cpal input: {}ch @ {}Hz fmt={:?}", in_channels, in_rate, in_fmt);
 
-        // TX: samples to play (mono from our modulator, duplicated to all output channels)
         let (tx_sender, tx_receiver): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = bounded(64);
         let tx_buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::<f32>::new()));
-        let tx_buf_clone = tx_buffer.clone();
 
-        let output_stream = match out_fmt {
-            cpal::SampleFormat::I16 => {
-                let tx_buf = tx_buf_clone;
-                output_device.build_output_stream(
-                    &out_config,
-                    move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
-                        while let Ok(chunk) = tx_receiver.try_recv() {
-                            tx_buf.lock().unwrap().extend_from_slice(&chunk);
+        let output_stream = {
+            let tx_buf = tx_buffer.clone();
+            output_device.build_output_stream(
+                &out_config,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    while let Ok(chunk) = tx_receiver.try_recv() {
+                        tx_buf.lock().unwrap().extend_from_slice(&chunk);
+                    }
+                    let mut buf = tx_buf.lock().unwrap();
+                    for frame in data.chunks_mut(out_channels as usize) {
+                        let sample = if buf.is_empty() { 0.0 } else { buf.remove(0) };
+                        for ch in frame.iter_mut() {
+                            *ch = sample;
                         }
-                        let mut buf = tx_buf.lock().unwrap();
-                        for frame in data.chunks_mut(out_channels as usize) {
-                            let sample = if buf.is_empty() { 0.0 } else { buf.remove(0) };
-                            let sample_i16 = (sample * i16::MAX as f32) as i16;
-                            for ch in frame.iter_mut() {
-                                *ch = sample_i16;
-                            }
-                        }
-                    },
-                    |err| tracing::error!("Output stream error: {}", err),
-                    None,
-                )?
-            }
-            _ => {
-                // F32 or anything else — use f32
-                let tx_buf = tx_buf_clone;
-                output_device.build_output_stream(
-                    &out_config,
-                    move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                        while let Ok(chunk) = tx_receiver.try_recv() {
-                            tx_buf.lock().unwrap().extend_from_slice(&chunk);
-                        }
-                        let mut buf = tx_buf.lock().unwrap();
-                        for frame in data.chunks_mut(out_channels as usize) {
-                            let sample = if buf.is_empty() { 0.0 } else { buf.remove(0) };
-                            for ch in frame.iter_mut() {
-                                *ch = sample;
-                            }
-                        }
-                    },
-                    |err| tracing::error!("Output stream error: {}", err),
-                    None,
-                )?
-            }
+                    }
+                },
+                |err| tracing::error!("Output stream error: {}", err),
+                None,
+            )?
         };
 
-        // RX: received samples (mix interleaved multi-channel input down to mono)
         let (rx_sender, rx_receiver): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = bounded(1024);
 
-        let input_stream = match in_fmt {
-            cpal::SampleFormat::I16 => {
-                input_device.build_input_stream(
-                    &in_config,
-                    move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                        let mono: Vec<f32> = data
-                            .chunks(in_channels as usize)
-                            .map(|frame| {
-                                let sum: f32 = frame.iter()
-                                    .map(|&s| s as f32 / i16::MAX as f32)
-                                    .sum();
-                                sum / in_channels as f32
-                            })
-                            .collect();
-                        let _ = rx_sender.try_send(mono);
-                    },
-                    |err| tracing::error!("Input stream error: {}", err),
-                    None,
-                )?
-            }
-            _ => {
-                input_device.build_input_stream(
-                    &in_config,
-                    move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                        let mono: Vec<f32> = data
-                            .chunks(in_channels as usize)
-                            .map(|frame| frame.iter().sum::<f32>() / in_channels as f32)
-                            .collect();
-                        let _ = rx_sender.try_send(mono);
-                    },
-                    |err| tracing::error!("Input stream error: {}", err),
-                    None,
-                )?
-            }
+        let input_stream = {
+            input_device.build_input_stream(
+                &in_config,
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let mono: Vec<f32> = data
+                        .chunks(in_channels as usize)
+                        .map(|frame| frame.iter().sum::<f32>() / in_channels as f32)
+                        .collect();
+                    let _ = rx_sender.try_send(mono);
+                },
+                |err| tracing::error!("Input stream error: {}", err),
+                None,
+            )?
         };
 
         output_stream.play()?;
@@ -688,8 +643,100 @@ impl AudioEngine {
         Ok(Self {
             tx_sender,
             rx_receiver,
-            _output_stream: output_stream,
-            _input_stream: input_stream,
+            _backend: AudioBackend::Cpal {
+                _output_stream: output_stream,
+                _input_stream: input_stream,
+            },
+        })
+    }
+
+    /// Create an engine using aplay/arecord subprocesses.
+    /// Works reliably on Pi with USB audio because these tools use
+    /// ALSA read/write mode (not MMAP) and respect ~/.asoundrc.
+    fn try_subprocess() -> Result<Self> {
+        use std::io::{Read as IoRead, Write as IoWrite};
+        use std::process::{Command, Stdio};
+
+        let rate_str = SUBPROCESS_RATE.to_string();
+
+        // Spawn aplay: reads raw S16_LE mono from stdin
+        let mut output_child = Command::new("aplay")
+            .args(["-D", "default", "-f", "S16_LE", "-r", &rate_str, "-c", "1", "-t", "raw", "-q"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("Failed to spawn aplay — is alsa-utils installed?")?;
+
+        // Spawn arecord: writes raw S16_LE mono to stdout
+        let mut input_child = Command::new("arecord")
+            .args(["-D", "default", "-f", "S16_LE", "-r", &rate_str, "-c", "1", "-t", "raw", "-q"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .context("Failed to spawn arecord — is alsa-utils installed?")?;
+
+        tracing::info!("Subprocess backend: aplay/arecord at {}Hz mono S16_LE", SUBPROCESS_RATE);
+
+        let (tx_sender, tx_receiver): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = bounded(64);
+        let (rx_sender, rx_receiver): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = bounded(1024);
+
+        // Output thread: receive f32 samples, convert to i16, write to aplay stdin
+        let mut aplay_stdin = output_child.stdin.take().context("No aplay stdin")?;
+        let output_thread = std::thread::Builder::new()
+            .name("aplay-writer".into())
+            .spawn(move || {
+                while let Ok(samples) = tx_receiver.recv() {
+                    let mut bytes = Vec::with_capacity(samples.len() * 2);
+                    for sample in &samples {
+                        let clamped = sample.clamp(-1.0, 1.0);
+                        let i16_val = (clamped * i16::MAX as f32) as i16;
+                        bytes.extend_from_slice(&i16_val.to_le_bytes());
+                    }
+                    if aplay_stdin.write_all(&bytes).is_err() {
+                        break;
+                    }
+                }
+            })
+            .context("Failed to spawn aplay writer thread")?;
+
+        // Input thread: read i16 from arecord stdout, convert to f32, send
+        let mut arecord_stdout = input_child.stdout.take().context("No arecord stdout")?;
+        let input_thread = std::thread::Builder::new()
+            .name("arecord-reader".into())
+            .spawn(move || {
+                let mut buf = [0u8; 2048]; // 1024 i16 samples
+                loop {
+                    match arecord_stdout.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let samples: Vec<f32> = buf[..n]
+                                .chunks_exact(2)
+                                .map(|pair| {
+                                    let i16_val = i16::from_le_bytes([pair[0], pair[1]]);
+                                    i16_val as f32 / i16::MAX as f32
+                                })
+                                .collect();
+                            if rx_sender.try_send(samples).is_err() {
+                                // Channel full, drop oldest
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            })
+            .context("Failed to spawn arecord reader thread")?;
+
+        Ok(Self {
+            tx_sender,
+            rx_receiver,
+            _backend: AudioBackend::Subprocess {
+                _output_child: output_child,
+                _input_child: input_child,
+                _output_thread: Some(output_thread),
+                _input_thread: Some(input_thread),
+            },
         })
     }
 
