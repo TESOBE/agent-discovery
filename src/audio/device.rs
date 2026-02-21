@@ -15,13 +15,29 @@ pub fn list_devices() -> Result<()> {
 
     println!("Audio host: {:?}", host.id());
 
+    if let Some(dev) = host.default_output_device() {
+        let name = dev.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "?".into());
+        println!("Default output device: {}", name);
+    }
+    if let Some(dev) = host.default_input_device() {
+        let name = dev.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "?".into());
+        println!("Default input device: {}", name);
+    }
+
     println!("\n--- Output Devices ---");
     if let Ok(devices) = host.output_devices() {
         for (i, device) in devices.enumerate() {
             let name = device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "Unknown".into());
             println!("  [{}] {}", i, name);
             if let Ok(config) = device.default_output_config() {
-                println!("      Default config: {:?}", config);
+                println!("      Default: {:?}", config);
+            }
+            if let Ok(configs) = device.supported_output_configs() {
+                for cfg in configs {
+                    println!("      Supported: ch={} rate={}-{} fmt={:?}",
+                        cfg.channels(), cfg.min_sample_rate(), cfg.max_sample_rate(),
+                        cfg.sample_format());
+                }
             }
         }
     }
@@ -32,7 +48,14 @@ pub fn list_devices() -> Result<()> {
             let name = device.description().map(|d| d.name().to_string()).unwrap_or_else(|_| "Unknown".into());
             println!("  [{}] {}", i, name);
             if let Ok(config) = device.default_input_config() {
-                println!("      Default config: {:?}", config);
+                println!("      Default: {:?}", config);
+            }
+            if let Ok(configs) = device.supported_input_configs() {
+                for cfg in configs {
+                    println!("      Supported: ch={} rate={}-{} fmt={:?}",
+                        cfg.channels(), cfg.min_sample_rate(), cfg.max_sample_rate(),
+                        cfg.sample_format());
+                }
             }
         }
     }
