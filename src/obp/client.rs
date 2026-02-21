@@ -4,10 +4,39 @@
 /// Callers provide the full API path (e.g. `/obp/v6.0.0/management/...`).
 /// The client only prepends the base URL.
 
+use std::time::Duration;
+
 use anyhow::{Context, Result};
 use serde_json::Value;
 
 use crate::config::Config;
+
+/// Check if an OBP API base URL is reachable by hitting /obp/v6.0.0/root.
+/// Returns Ok(()) if the endpoint responds with a success status, Err otherwise.
+pub async fn check_obp_reachable(base_url: &str) -> Result<()> {
+    let url = format!("{}/obp/{}/root", base_url.trim_end_matches('/'), API_VERSION);
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("Failed to build HTTP client for reachability check")?;
+
+    let response = client
+        .get(&url)
+        .send()
+        .await
+        .context(format!("OBP reachability check failed for {}", url))?;
+
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "OBP reachability check got status {} from {}",
+            response.status(),
+            url
+        )
+    }
+}
 
 /// The OBP API version used for management and resource-docs endpoints.
 pub const API_VERSION: &str = "v6.0.0";

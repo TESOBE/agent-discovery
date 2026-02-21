@@ -15,7 +15,7 @@ use crate::config::Config;
 use crate::discovery::manager::{DiscoveryConfig, DiscoveryEvent, DiscoveryManager};
 use crate::mcp::client::McpClient;
 use crate::negotiation::claude::ClaudeNegotiator;
-use crate::obp::client::ObpClient;
+use crate::obp::client::{ObpClient, check_obp_reachable};
 use crate::obp::entities;
 use crate::obp::exploration::ExplorationMsg;
 use crate::protocol::{codec, message::Capabilities};
@@ -1830,7 +1830,8 @@ fn hello_second_from_name(name: &str) -> u32 {
         hash ^= *byte as u32;
         hash = hash.wrapping_mul(16777619);
     }
-    (hash % 6) * 10
+    // 3 slots × 20s = 0, 20, 40. Max TX is ~14s, so ~6s clearance per slot.
+    (hash % 3) * 20
 }
 
 /// Run the audio announce loop — says "hello" by broadcasting an agent-specific
@@ -1985,7 +1986,7 @@ async fn run_announce_loop(
 
         // Carrier-sense: back off if another agent is chirping
         const CS_THRESHOLD: f32 = 0.02; // ~2% amplitude, well above noise floor
-        const CS_MAX_RETRIES: u32 = 5;
+        const CS_MAX_RETRIES: u32 = 8; // 8 × 2s = 16s, covers max ~14s TX
         const CS_RETRY_MS: u64 = 2000;
 
         for retry in 0..CS_MAX_RETRIES {
@@ -2087,7 +2088,7 @@ async fn run_receive_loop(
         // Publish carrier-sense energy and decay every 200ms
         if last_cs_update.elapsed() >= std::time::Duration::from_millis(200) {
             channel_energy.store((cs_peak * 10000.0) as u32, Ordering::Release);
-            cs_peak *= 0.3; // decay so stale values don't persist
+            cs_peak *= 0.7; // gentle decay — takes ~1.6s to drop below threshold
             last_cs_update = std::time::Instant::now();
         }
 
@@ -2192,7 +2193,21 @@ async fn run_receive_loop(
                         peer.receive_url_chunk(&chunk);
                         if let Some(url) = peer.try_assemble_url() {
                             tracing::info!("RX: URL complete: {}", url);
-                            peer.obp_api_base_url = url;
+                            peer.obp_api_base_url = url.clone();
+                            let url_for_check = url;
+                            tokio::spawn(async move {
+                                match check_obp_reachable(&url_for_check).await {
+                                    Ok(()) => tracing::info!(
+                                        url = %url_for_check,
+                                        "OBP reachability check succeeded (audio)"
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        url = %url_for_check,
+                                        error = %e,
+                                        "OBP reachability check failed (audio)"
+                                    ),
+                                }
+                            });
                         }
                     }
                 }
@@ -2480,6 +2495,22 @@ async fn run_udp_receive_loop(
                             src = %src,
                             "UDP: Discovered peer"
                         );
+                        if !msg.obp_api_base_url.is_empty() {
+                            let url_for_check = msg.obp_api_base_url.clone();
+                            tokio::spawn(async move {
+                                match check_obp_reachable(&url_for_check).await {
+                                    Ok(()) => tracing::info!(
+                                        url = %url_for_check,
+                                        "OBP reachability check succeeded (UDP)"
+                                    ),
+                                    Err(e) => tracing::warn!(
+                                        url = %url_for_check,
+                                        error = %e,
+                                        "OBP reachability check failed (UDP)"
+                                    ),
+                                }
+                            });
+                        }
                     }
                 }
             }
