@@ -429,6 +429,8 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
                         &peer,
                         &mut negotiated_peers,
                         &handshake_done,
+                        &mood,
+                        &discovery_manager,
                     )
                     .await;
                 }
@@ -475,6 +477,8 @@ async fn handle_new_peer(
     peer: &crate::discovery::peer::Peer,
     negotiated_peers: &mut std::collections::HashSet<Uuid>,
     handshake_done: &Arc<AtomicBool>,
+    mood: &AgentMoodTracker,
+    discovery_manager: &Arc<tokio::sync::Mutex<DiscoveryManager>>,
 ) {
     // Don't re-negotiate with peers we already handshook
     if negotiated_peers.contains(&peer.agent_id) {
@@ -514,6 +518,7 @@ async fn handle_new_peer(
                         establish_tcp_channel(
                             agent_id, agent_name, peer,
                             mcp_client, obp_client, mcp_diagnosis,
+                            mood, discovery_manager,
                         ).await;
                     }
                     "obp" => {
@@ -524,6 +529,7 @@ async fn handle_new_peer(
                         establish_tcp_channel(
                             agent_id, agent_name, peer,
                             mcp_client, obp_client, mcp_diagnosis,
+                            mood, discovery_manager,
                         ).await;
                     }
                     other => {
@@ -544,6 +550,7 @@ async fn handle_new_peer(
         establish_tcp_channel(
             agent_id, agent_name, peer,
             mcp_client, obp_client, mcp_diagnosis,
+            mood, discovery_manager,
         ).await;
         negotiated_peers.insert(peer.agent_id);
         handshake_done.store(true, Ordering::Release);
@@ -564,6 +571,8 @@ async fn establish_tcp_channel(
     mcp_client: &Option<Arc<tokio::sync::Mutex<McpClient>>>,
     obp_client: &Option<Arc<ObpClient>>,
     mcp_diagnosis: &Option<Vec<String>>,
+    mood: &AgentMoodTracker,
+    discovery_manager: &Arc<tokio::sync::Mutex<DiscoveryManager>>,
 ) {
     let peer_address = peer.address.clone();
     let greeting = serde_json::json!({
@@ -630,6 +639,8 @@ async fn establish_tcp_channel(
         mcp_client,
         obp_client,
         mcp_diagnosis,
+        mood,
+        discovery_manager,
     )
     .await;
 }
@@ -689,6 +700,8 @@ async fn run_obp_exploration_initiator(
     mcp_client: &Option<Arc<tokio::sync::Mutex<McpClient>>>,
     obp_client: &Option<Arc<ObpClient>>,
     mcp_diagnosis: &Option<Vec<String>>,
+    mood: &AgentMoodTracker,
+    discovery_manager: &Arc<tokio::sync::Mutex<DiscoveryManager>>,
 ) {
     tracing::info!("=== Starting OBP Exploration (initiator) ===");
 
@@ -1020,12 +1033,24 @@ async fn run_obp_exploration_initiator(
 
         // Step 3: Publish a test message to the agent-discovery channel
         let test_channel = "agent-discovery";
+        let mood_summary = mood.summary();
+        let paired_peers: Vec<serde_json::Value> = {
+            let mgr_guard = discovery_manager.lock().await;
+            mgr_guard.peers().iter()
+                .map(|p| serde_json::json!({
+                    "address": p.address,
+                    "obp_api_base_url": p.obp_api_base_url,
+                }))
+                .collect()
+        };
         let test_payload = serde_json::json!({
             "payload": {
                 "from": agent_name,
                 "type": "exploration-test",
                 "timestamp": entities::iso_now(),
-                "message": format!("Signal channel test from {}", agent_name)
+                "message": format!("Signal channel test from {}", agent_name),
+                "mood": mood_summary,
+                "paired_peers": paired_peers,
             }
         });
 
