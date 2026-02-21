@@ -504,15 +504,33 @@ pub struct AudioEngine {
     _input_stream: cpal::Stream,
 }
 
+/// Standard audio rates to try, in preference order.
+const PREFERRED_RATES: &[u32] = &[48000, 44100, 96000, 32000, 16000];
+
+/// Pick a sensible sample rate from a supported range.
+/// The ALSA plughw wrapper often claims to support 1–384000 Hz, so
+/// `with_max_sample_rate()` would pick something absurd. Instead we
+/// choose the first standard rate that falls within the range.
+fn pick_rate(range: &cpal::SupportedStreamConfigRange) -> u32 {
+    let min = range.min_sample_rate();
+    let max = range.max_sample_rate();
+    for &rate in PREFERRED_RATES {
+        if rate >= min && rate <= max {
+            return rate;
+        }
+    }
+    max
+}
+
 /// Find the best supported config for an output device.
 /// Prefers I16 (works on USB hardware). Returns (channels, sample_rate, format).
-fn best_output_config(device: &cpal::Device) -> Result<(u16, cpal::SampleRate, cpal::SampleFormat)> {
+fn best_output_config(device: &cpal::Device) -> Result<(u16, u32, cpal::SampleFormat)> {
     // First look for an I16 config (USB hardware native format)
     if let Ok(configs) = device.supported_output_configs() {
         for range in configs {
             if range.sample_format() == cpal::SampleFormat::I16 {
-                let cfg = range.with_max_sample_rate();
-                return Ok((cfg.channels(), cfg.sample_rate(), cpal::SampleFormat::I16));
+                let rate = pick_rate(&range);
+                return Ok((range.channels(), rate, cpal::SampleFormat::I16));
             }
         }
     }
@@ -522,12 +540,12 @@ fn best_output_config(device: &cpal::Device) -> Result<(u16, cpal::SampleRate, c
     Ok((default.channels(), default.sample_rate(), default.sample_format()))
 }
 
-fn best_input_config(device: &cpal::Device) -> Result<(u16, cpal::SampleRate, cpal::SampleFormat)> {
+fn best_input_config(device: &cpal::Device) -> Result<(u16, u32, cpal::SampleFormat)> {
     if let Ok(configs) = device.supported_input_configs() {
         for range in configs {
             if range.sample_format() == cpal::SampleFormat::I16 {
-                let cfg = range.with_max_sample_rate();
-                return Ok((cfg.channels(), cfg.sample_rate(), cpal::SampleFormat::I16));
+                let rate = pick_rate(&range);
+                return Ok((range.channels(), rate, cpal::SampleFormat::I16));
             }
         }
     }
