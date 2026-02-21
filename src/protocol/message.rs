@@ -37,6 +37,7 @@ impl Capabilities {
     pub const HTTP: u8 = 0b0000_0010;
     pub const OBP: u8 = 0b0000_0100;
     pub const CLAUDE_NEGOTIATION: u8 = 0b0000_1000;
+    pub const AUDIO: u8 = 0b0001_0000;
 
     pub fn new() -> Self {
         Self(0)
@@ -62,6 +63,11 @@ impl Capabilities {
         self
     }
 
+    pub fn with_audio(mut self) -> Self {
+        self.0 |= Self::AUDIO;
+        self
+    }
+
     pub fn has_tcp(self) -> bool {
         self.0 & Self::TCP != 0
     }
@@ -78,6 +84,10 @@ impl Capabilities {
         self.0 & Self::CLAUDE_NEGOTIATION != 0
     }
 
+    pub fn has_audio(self) -> bool {
+        self.0 & Self::AUDIO != 0
+    }
+
     /// Human-readable description of enabled capabilities.
     pub fn describe(self) -> String {
         let mut parts = Vec::new();
@@ -85,6 +95,7 @@ impl Capabilities {
         if self.has_http() { parts.push("HTTP"); }
         if self.has_obp() { parts.push("OBP"); }
         if self.has_claude() { parts.push("Claude"); }
+        if self.has_audio() { parts.push("audio"); }
         if parts.is_empty() {
             "none".to_string()
         } else {

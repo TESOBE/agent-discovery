@@ -80,29 +80,45 @@ impl std::fmt::Display for AgentMood {
     }
 }
 
-/// Thread-safe mood tracker backed by an AtomicU8.
+/// Thread-safe agent status tracker.
+///
+/// Combines mood (peer connectivity) with capabilities (audio, OBP, Claude, etc).
+/// Capabilities use the same bitmask as the wire protocol.
 #[derive(Clone)]
-pub struct MoodTracker {
-    value: Arc<AtomicU8>,
+pub struct AgentStatus {
+    mood: Arc<AtomicU8>,
+    capabilities: Capabilities,
 }
 
-impl MoodTracker {
-    pub fn new(initial: AgentMood) -> Self {
-        Self { value: Arc::new(AtomicU8::new(initial as u8)) }
+impl AgentStatus {
+    pub fn new(capabilities: Capabilities) -> Self {
+        let initial = if !capabilities.has_audio() && !capabilities.has_obp() {
+            AgentMood::Struggling
+        } else {
+            AgentMood::Lonely
+        };
+        Self {
+            mood: Arc::new(AtomicU8::new(initial as u8)),
+            capabilities,
+        }
     }
 
-    pub fn get(&self) -> AgentMood {
-        AgentMood::from_u8(self.value.load(Ordering::Relaxed))
+    pub fn mood(&self) -> AgentMood {
+        AgentMood::from_u8(self.mood.load(Ordering::Relaxed))
     }
 
-    /// Update mood and log if it changed. Returns true if mood changed.
-    pub fn set(&self, mood: AgentMood) -> bool {
-        let old = self.value.swap(mood as u8, Ordering::Relaxed);
+    pub fn capabilities(&self) -> Capabilities {
+        self.capabilities
+    }
+
+    /// Update mood and log if it changed.
+    pub fn set_mood(&self, mood: AgentMood) -> bool {
+        let old = self.mood.swap(mood as u8, Ordering::Relaxed);
         if old != mood as u8 {
             let old_mood = AgentMood::from_u8(old);
             tracing::info!(
                 old = %old_mood, new = %mood,
-                "Agent mood changed: {} -> {}", old_mood, mood
+                "Agent mood: {} -> {}", old_mood, mood
             );
             true
         } else {
@@ -112,7 +128,12 @@ impl MoodTracker {
 
     /// Update mood from the current peer count.
     pub fn update_from_peers(&self, peer_count: usize) {
-        self.set(AgentMood::from_peer_count(peer_count));
+        self.set_mood(AgentMood::from_peer_count(peer_count));
+    }
+
+    /// One-line status summary: "Mood [capabilities]"
+    pub fn summary(&self) -> String {
+        format!("{} [{}]", self.mood(), self.capabilities.describe())
     }
 }
 
@@ -260,16 +281,14 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
         }
     };
 
-    // Agent mood — reflects connectivity status
-    let has_audio = audio_engine.is_some();
-    let has_obp = obp_client.is_some();
-    let initial_mood = if !has_audio && !has_obp {
-        AgentMood::Struggling
-    } else {
-        AgentMood::Lonely
-    };
-    let mood = MoodTracker::new(initial_mood);
-    tracing::info!(mood = %mood.get(), "Initial agent mood: {}", mood.get());
+    // Set audio capability now that we know if the engine started
+    if audio_engine.is_some() {
+        capabilities = capabilities.with_audio();
+    }
+
+    // Agent status — mood (peer connectivity) + capabilities (services)
+    let status = AgentStatus::new(capabilities);
+    tracing::info!(status = %status.summary(), "Initial agent status: {}", status.summary());
 
     // Shared flag: when true, the RX loop discards samples to avoid self-echo
     let is_transmitting = Arc::new(AtomicBool::new(false));
@@ -345,21 +364,21 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
     // Track peers we've already negotiated with, so we don't re-negotiate on PeerUpdated
     let mut negotiated_peers = std::collections::HashSet::<Uuid>::new();
 
-    // Periodic mood/status logger (every 30 seconds)
+    // Periodic status logger (every 30 seconds)
     {
         let mgr = discovery_manager.clone();
-        let m = mood.clone();
+        let s = status.clone();
         let name = agent_name.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                 let peer_count = mgr.lock().await.peers().len();
-                m.update_from_peers(peer_count);
+                s.update_from_peers(peer_count);
                 tracing::info!(
-                    mood = %m.get(),
+                    status = %s.summary(),
                     peers = peer_count,
                     "Agent '{}' status: {} ({} peer{})",
-                    name, m.get(), peer_count, if peer_count == 1 { "" } else { "s" }
+                    name, s.summary(), peer_count, if peer_count == 1 { "" } else { "s" }
                 );
             }
         }.instrument(agent_span.clone()));
@@ -379,14 +398,14 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
                         let mgr = discovery_manager.lock().await;
                         mgr.peers().len()
                     };
-                    mood.update_from_peers(peer_count);
+                    status.update_from_peers(peer_count);
 
                     tracing::info!(
                         peer_id = %peer.agent_id,
                         address = %peer.address,
-                        mood = %mood.get(),
-                        "New peer discovered! Mood: {}. Starting negotiation...",
-                        mood.get()
+                        status = %status.summary(),
+                        "New peer discovered! Status: {}. Starting negotiation...",
+                        status.summary()
                     );
 
                     handle_new_peer(
@@ -413,12 +432,12 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
                         let mgr = discovery_manager.lock().await;
                         mgr.peers().len()
                     };
-                    mood.update_from_peers(peer_count);
+                    status.update_from_peers(peer_count);
                     tracing::info!(
                         peer_id = %id,
-                        mood = %mood.get(),
-                        "Peer lost. Mood: {} ({} peer{} remaining)",
-                        mood.get(), peer_count, if peer_count == 1 { "" } else { "s" }
+                        status = %status.summary(),
+                        "Peer lost. Status: {} ({} peer{} remaining)",
+                        status.summary(), peer_count, if peer_count == 1 { "" } else { "s" }
                     );
                 }
             },
