@@ -1840,19 +1840,6 @@ async fn run_task_request_poller(
                         let payload = msg.get("payload").cloned()
                             .unwrap_or(serde_json::Value::Null);
 
-                        // Skip our own acks and responses to avoid infinite loops
-                        let msg_type = payload.get("type")
-                            .and_then(|v| v.as_str())
-                            .unwrap_or("");
-                        if msg_type == "task-ack" || msg_type == "task-response" {
-                            tracing::debug!(
-                                message_id = %msg_id,
-                                msg_type = %msg_type,
-                                "Task poller: skipping non-request message"
-                            );
-                            continue;
-                        }
-
                         // Authorization check: only process tasks from
                         // configured instructor users. If no instructors are
                         // configured, all tasks are rejected.
@@ -1888,7 +1875,7 @@ async fn run_task_request_poller(
                             }
                         });
                         if let Err(e) = publish_signal_message_via_http(
-                            &obp, "task-requests", &ack
+                            &obp, "task-responses", &ack
                         ).await {
                             tracing::warn!("Task poller: failed to ack task {}: {}", msg_id, e);
                         }
@@ -1932,7 +1919,7 @@ async fn run_task_request_poller(
                         };
 
                         if let Err(e) = publish_signal_message_via_http(
-                            &obp, "task-requests", &response_payload
+                            &obp, "task-responses", &response_payload
                         ).await {
                             tracing::warn!(
                                 "Task poller: failed to post task-response for {}: {}",
