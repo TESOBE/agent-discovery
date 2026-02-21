@@ -115,11 +115,7 @@ impl AgentMoodTracker {
     pub fn set_mood(&self, mood: AgentMood) -> bool {
         let old = self.mood.swap(mood as u8, Ordering::Relaxed);
         if old != mood as u8 {
-            let old_mood = AgentMood::from_u8(old);
-            tracing::info!(
-                old = %old_mood, new = %mood,
-                "Agent mood: {} -> {}", old_mood, mood
-            );
+            tracing::info!("Agent mood: {} -> {}", AgentMood::from_u8(old), mood);
             true
         } else {
             false
@@ -227,6 +223,7 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
         agent_address: agent_address.clone(),
         capabilities,
         tx_band,
+        obp_api_base_url: config.obp_api_base_url.clone(),
         ..Default::default()
     };
 
@@ -375,14 +372,26 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                let peer_count = mgr.lock().await.peers().len();
+                let mgr_guard = mgr.lock().await;
+                let peer_count = mgr_guard.peers().len();
+                let peer_obp_urls: Vec<String> = mgr_guard.peers().iter()
+                    .filter(|p| !p.obp_api_base_url.is_empty())
+                    .map(|p| format!("{}={}", p.address, p.obp_api_base_url))
+                    .collect();
+                drop(mgr_guard);
                 m.update_from_peers(peer_count);
-                tracing::info!(
-                    mood = %m.summary(),
-                    peers = peer_count,
-                    "Agent '{}' mood: {} ({} peer{})",
-                    name, m.summary(), peer_count, if peer_count == 1 { "" } else { "s" }
-                );
+                if peer_obp_urls.is_empty() {
+                    tracing::info!(
+                        "Agent '{}' mood: {} ({} peer{})",
+                        name, m.summary(), peer_count, if peer_count == 1 { "" } else { "s" }
+                    );
+                } else {
+                    tracing::info!(
+                        "Agent '{}' mood: {} ({} peer{}, OBP URLs: {})",
+                        name, m.summary(), peer_count, if peer_count == 1 { "" } else { "s" },
+                        peer_obp_urls.join(", ")
+                    );
+                }
             }
         }.instrument(agent_span.clone()));
     }
@@ -404,11 +413,8 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
                     mood.update_from_peers(peer_count);
 
                     tracing::info!(
-                        peer_id = %peer.agent_id,
-                        address = %peer.address,
-                        mood = %mood.summary(),
-                        "New peer discovered! Mood: {}. Starting negotiation...",
-                        mood.summary()
+                        "New peer discovered ({}@{})! Mood: {}. Starting negotiation...",
+                        peer.agent_id, peer.address, mood.summary()
                     );
 
                     handle_new_peer(
@@ -437,10 +443,8 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
                     };
                     mood.update_from_peers(peer_count);
                     tracing::info!(
-                        peer_id = %id,
-                        mood = %mood.summary(),
-                        "Peer lost. Mood: {} ({} peer{} remaining)",
-                        mood.summary(), peer_count, if peer_count == 1 { "" } else { "s" }
+                        "Peer {} lost. Mood: {} ({} peer{} remaining)",
+                        id, mood.summary(), peer_count, if peer_count == 1 { "" } else { "s" }
                     );
                 }
             },
@@ -691,6 +695,7 @@ async fn run_obp_exploration_initiator(
     // Phase 1: Send ExploreStart, receive ExploreAck
     let start_msg = ExplorationMsg::ExploreStart {
         agent_name: agent_name.to_string(),
+        obp_api_base_url: obp_client.as_ref().map(|o| o.base_url().to_string()).unwrap_or_default(),
     };
     if let Err(e) = send_exploration_msg(&channel, &start_msg).await {
         tracing::error!("Failed to send ExploreStart: {}", e);
@@ -699,8 +704,9 @@ async fn run_obp_exploration_initiator(
     tracing::info!("Sent ExploreStart to responder");
 
     match recv_exploration_msg(&channel).await {
-        Ok(ExplorationMsg::ExploreAck { agent_name: peer_name, .. }) => {
-            tracing::info!("Received ExploreAck from {}", peer_name);
+        Ok(ExplorationMsg::ExploreAck { agent_name: peer_name, obp_api_base_url: peer_obp_url, .. }) => {
+            tracing::info!("Received ExploreAck from {} (OBP URL: {})", peer_name,
+                if peer_obp_url.is_empty() { "(none)" } else { &peer_obp_url });
         }
         Ok(other) => {
             tracing::warn!("Expected ExploreAck, got: {:?}", other);
@@ -1151,10 +1157,12 @@ async fn run_obp_exploration_responder(
 
     // Expect ExploreStart
     match recv_exploration_msg(&channel).await {
-        Ok(ExplorationMsg::ExploreStart { agent_name: peer_name }) => {
-            tracing::info!("Received ExploreStart from {}", peer_name);
+        Ok(ExplorationMsg::ExploreStart { agent_name: peer_name, obp_api_base_url: peer_obp_url }) => {
+            tracing::info!("Received ExploreStart from {} (OBP URL: {})", peer_name,
+                if peer_obp_url.is_empty() { "(none)" } else { &peer_obp_url });
             let _ = send_exploration_msg(&channel, &ExplorationMsg::ExploreAck {
                 agent_name: agent_name.to_string(),
+                obp_api_base_url: obp_client.as_ref().map(|o| o.base_url().to_string()).unwrap_or_default(),
             }).await;
         }
         Ok(other) => {
@@ -1900,11 +1908,12 @@ async fn run_announce_loop(
             .and_then(|p| p.parse::<u16>().ok())
             .unwrap_or(0);
         let caps = mgr.config().capabilities.0;
+        let obp_url = mgr.config().obp_api_base_url.clone();
         drop(mgr);
 
         let caps_desc = crate::protocol::message::Capabilities(caps).describe();
 
-        let binary_msg = chirp::encode_chirp_message(port, caps, sample_rate);
+        let binary_msg = chirp::encode_chirp_message(port, caps, minutes_between_hellos as u8, sample_rate);
         let call_samples = chirp_sig.call_chirp(sample_rate, amplitude);
 
         let mut samples_to_send = Vec::with_capacity(
@@ -1913,6 +1922,18 @@ async fn run_announce_loop(
         samples_to_send.extend_from_slice(&call_samples);
         samples_to_send.extend_from_slice(&section_gap);
         samples_to_send.extend_from_slice(&binary_msg);
+
+        // Append URL chirp burst if OBP URL is configured
+        if !obp_url.is_empty() {
+            let url_chirp = chirp::encode_chirp_url(&obp_url, sample_rate);
+            let url_duration = url_chirp.len() as f32 / sample_rate as f32;
+            tracing::info!(
+                "TX: Sending OBP URL chirp ({} bytes, ~{:.1}s)",
+                obp_url.len(), url_duration
+            );
+            samples_to_send.extend_from_slice(&section_gap);
+            samples_to_send.extend_from_slice(&url_chirp);
+        }
 
         let total_duration_secs = samples_to_send.len() as f32 / sample_rate as f32;
 
@@ -1971,8 +1992,8 @@ async fn run_receive_loop(
     let mut post_tx_cooldown = std::time::Instant::now() - std::time::Duration::from_secs(10);
     let mut was_transmitting = false;
 
-    // Minimum buffer: a binary chirp message is 44 × 100ms ≈ 4.4s
-    let min_msg_samples = (sample_rate as f32 * 4.0) as usize;
+    // Minimum buffer: a binary chirp message is 52 × 100ms ≈ 5.2s
+    let min_msg_samples = (sample_rate as f32 * 5.0) as usize;
 
     tracing::info!(
         own_port,
@@ -2031,7 +2052,7 @@ async fn run_receive_loop(
         // Try to decode a binary chirp message when we have enough audio
         if sample_buffer.len() >= min_msg_samples {
             decode_attempts += 1;
-            if let Some((port, caps)) = chirp::decode_chirp_message_sweep(&sample_buffer, sample_rate) {
+            if let Some((port, caps, next_hello_mins)) = chirp::decode_chirp_message_sweep(&sample_buffer, sample_rate) {
                 // Self-echo check: if the decoded port is our own, discard
                 if port == own_port {
                     tracing::debug!("RX: Decoded own port {} → self-echo, ignoring", port);
@@ -2046,12 +2067,25 @@ async fn run_receive_loop(
                     port,
                     capabilities = caps,
                     caps_desc = %caps_desc,
+                    next_hello_mins,
                     hellos = hellos_heard,
-                    "RX: Heard hello! Peer at {} — port={} caps=0x{:02X} [{}]",
-                    address, port, caps, caps_desc
+                    "RX: Heard hello! Peer at {} — port={} caps=0x{:02X} [{}] next_hello={}min",
+                    address, port, caps, caps_desc, next_hello_mins
                 );
 
-                // Register the peer
+                // Try to decode an optional URL chirp burst from the remaining buffer
+                let peer_obp_url = match chirp::decode_chirp_url_sweep(&sample_buffer, sample_rate) {
+                    Some(url) => {
+                        tracing::info!("RX: Decoded OBP URL chirp from peer: {}", url);
+                        url
+                    }
+                    None => {
+                        tracing::debug!("RX: No URL chirp burst found (peer may not have one)");
+                        String::new()
+                    }
+                };
+
+                // Register the peer with its advertised hello interval
                 let pseudo_id = {
                     let mut bytes = [0u8; 16];
                     let port_bytes = port.to_be_bytes();
@@ -2061,13 +2095,30 @@ async fn run_receive_loop(
                     bytes[15] = port_bytes[1];
                     Uuid::from_bytes(bytes)
                 };
-                let msg = crate::protocol::message::DiscoveryMessage::announce(
-                    pseudo_id,
-                    &address,
-                    crate::protocol::message::Capabilities(caps),
-                );
                 let mut mgr = manager.lock().await;
-                mgr.handle_message(&msg);
+                // Check if peer already exists to use update_with_interval
+                if let Some(peer) = mgr.peers_mut().get_mut(&pseudo_id) {
+                    peer.update_with_interval(
+                        address.clone(),
+                        crate::protocol::message::Capabilities(caps),
+                        next_hello_mins,
+                    );
+                    if !peer_obp_url.is_empty() {
+                        peer.obp_api_base_url = peer_obp_url;
+                    }
+                } else {
+                    let msg = crate::protocol::message::DiscoveryMessage::announce(
+                        pseudo_id,
+                        &address,
+                        crate::protocol::message::Capabilities(caps),
+                        &peer_obp_url,
+                    );
+                    mgr.handle_message(&msg);
+                    // Set next_hello_mins on the newly added peer
+                    if let Some(peer) = mgr.peers_mut().get_mut(&pseudo_id) {
+                        peer.next_hello_mins = next_hello_mins;
+                    }
+                }
                 peer_found.store(true, Ordering::Release);
                 sample_buffer.clear();
                 continue;
@@ -2342,11 +2393,13 @@ async fn run_udp_receive_loop(
         match socket.recv_from(&mut buf).await {
             Ok((len, src)) => {
                 if let Some(msg) = codec::decode_message(&buf[..len]) {
+                    let obp_url = if msg.obp_api_base_url.is_empty() { "(none)".to_string() } else { msg.obp_api_base_url.clone() };
                     let mut mgr = manager.lock().await;
                     if mgr.handle_message(&msg) {
                         tracing::info!(
                             peer_id = %msg.agent_id,
                             address = %msg.address,
+                            obp_url = %obp_url,
                             src = %src,
                             "UDP: Discovered peer"
                         );

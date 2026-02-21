@@ -118,28 +118,34 @@ pub struct DiscoveryMessage {
     pub agent_id: Uuid,
     pub address: String,
     pub capabilities: Capabilities,
+    /// The OBP API base URL this agent uses (e.g. "https://apisandbox.openbankproject.com").
+    /// Empty string if not configured. Shared so peers on different networks can
+    /// coordinate via a common OBP instance.
+    pub obp_api_base_url: String,
 }
 
 impl DiscoveryMessage {
     /// Create a new Announce message.
-    pub fn announce(agent_id: Uuid, address: &str, capabilities: Capabilities) -> Self {
+    pub fn announce(agent_id: Uuid, address: &str, capabilities: Capabilities, obp_api_base_url: &str) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             msg_type: MessageType::Announce,
             agent_id,
             address: address.to_string(),
             capabilities,
+            obp_api_base_url: obp_api_base_url.to_string(),
         }
     }
 
     /// Create a new Ack message.
-    pub fn ack(agent_id: Uuid, address: &str, capabilities: Capabilities) -> Self {
+    pub fn ack(agent_id: Uuid, address: &str, capabilities: Capabilities, obp_api_base_url: &str) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             msg_type: MessageType::Ack,
             agent_id,
             address: address.to_string(),
             capabilities,
+            obp_api_base_url: obp_api_base_url.to_string(),
         }
     }
 
@@ -151,6 +157,7 @@ impl DiscoveryMessage {
             agent_id,
             address: String::new(),
             capabilities: Capabilities::new(),
+            obp_api_base_url: String::new(),
         }
     }
 }

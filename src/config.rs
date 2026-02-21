@@ -6,7 +6,7 @@ pub struct Config {
     pub agent_listen_port: u16,
     pub claude_api_key: String,
     pub claude_model: String,
-    pub obp_base_url: String,
+    pub obp_api_base_url: String,
     pub obp_username: String,
     pub obp_password: String,
     pub obp_consumer_key: String,
@@ -36,7 +36,7 @@ impl Config {
                 .unwrap_or_default(),
             claude_model: std::env::var("CLAUDE_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-4-20250514".into()),
-            obp_base_url: std::env::var("OBP_BASE_URL").unwrap_or_default(),
+            obp_api_base_url: std::env::var("OBP_API_BASE_URL").unwrap_or_default(),
             obp_username: std::env::var("OBP_USERNAME").unwrap_or_default(),
             obp_password: std::env::var("OBP_PASSWORD").unwrap_or_default(),
             obp_consumer_key: std::env::var("OBP_CONSUMER_KEY").unwrap_or_default(),

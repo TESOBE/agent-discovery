@@ -16,7 +16,7 @@ use crate::protocol::codec;
 use crate::protocol::frame;
 use crate::protocol::message::{Capabilities, DiscoveryMessage};
 
-use super::peer::{Peer, PEER_TIMEOUT_SECS};
+use super::peer::Peer;
 
 /// Discovery events emitted by the manager.
 #[derive(Debug, Clone)]
@@ -35,6 +35,8 @@ pub struct DiscoveryConfig {
     pub jitter_max_ms: u64,
     /// Which of the 9 frequency bands this agent transmits on (0-8).
     pub tx_band: usize,
+    /// The OBP API base URL to broadcast to peers.
+    pub obp_api_base_url: String,
 }
 
 impl Default for DiscoveryConfig {
@@ -46,6 +48,7 @@ impl Default for DiscoveryConfig {
             announce_interval: Duration::from_secs(5),
             jitter_max_ms: 1000,
             tx_band: 0,
+            obp_api_base_url: String::new(),
         }
     }
 }
@@ -81,6 +84,7 @@ impl DiscoveryManager {
             self.config.agent_id,
             &self.config.agent_address,
             self.config.capabilities,
+            &self.config.obp_api_base_url,
         )
     }
 
@@ -129,10 +133,10 @@ impl DiscoveryManager {
             crate::protocol::message::MessageType::Announce
             | crate::protocol::message::MessageType::Ack => {
                 if let Some(peer) = self.peers.get_mut(&msg.agent_id) {
-                    peer.update(msg.address.clone(), msg.capabilities);
+                    peer.update(msg.address.clone(), msg.capabilities, msg.obp_api_base_url.clone());
                     let _ = self.event_tx.send(DiscoveryEvent::PeerUpdated(peer.clone()));
                 } else {
-                    let peer = Peer::new(msg.agent_id, msg.address.clone(), msg.capabilities);
+                    let peer = Peer::new(msg.agent_id, msg.address.clone(), msg.capabilities, msg.obp_api_base_url.clone());
                     tracing::info!(
                         peer_id = %msg.agent_id,
                         address = %msg.address,
@@ -165,15 +169,22 @@ impl DiscoveryManager {
             .collect();
 
         for id in expired {
-            self.peers.remove(&id);
-            tracing::info!(peer_id = %id, "Peer expired (timeout={}s)", PEER_TIMEOUT_SECS);
-            let _ = self.event_tx.send(DiscoveryEvent::PeerLost(id));
+            if let Some(peer) = self.peers.remove(&id) {
+                tracing::info!("Peer {} expired (timeout={}s, next_hello={}min)",
+                    id, peer.timeout_secs(), peer.next_hello_mins);
+                let _ = self.event_tx.send(DiscoveryEvent::PeerLost(id));
+            }
         }
     }
 
     /// Get a snapshot of known peers.
     pub fn peers(&self) -> Vec<&Peer> {
         self.peers.values().collect()
+    }
+
+    /// Get mutable access to the peers map (for updating peer fields like next_hello_mins).
+    pub fn peers_mut(&mut self) -> &mut HashMap<Uuid, Peer> {
+        &mut self.peers
     }
 
     /// Get this agent's ID.
@@ -260,6 +271,7 @@ mod tests {
             agent_id,
             "127.0.0.1:9000",
             Capabilities::new().with_tcp(),
+            "",
         );
 
         // Self-echo should be ignored
@@ -277,11 +289,13 @@ mod tests {
             peer_id,
             "192.168.1.42:9000",
             Capabilities::new().with_tcp().with_obp(),
+            "https://apisandbox.openbankproject.com",
         );
 
         assert!(manager.handle_message(&msg));
         assert_eq!(manager.peers().len(), 1);
         assert_eq!(manager.peers()[0].agent_id, peer_id);
+        assert_eq!(manager.peers()[0].obp_api_base_url, "https://apisandbox.openbankproject.com");
 
         // Check event was emitted
         let event = rx.try_recv().expect("Should have event");
@@ -303,11 +317,13 @@ mod tests {
             peer_id,
             "192.168.1.42:9000",
             Capabilities::new().with_tcp(),
+            "",
         );
         let msg2 = DiscoveryMessage::announce(
             peer_id,
             "192.168.1.42:9001",
             Capabilities::new().with_tcp().with_obp(),
+            "https://example.com",
         );
 
         manager.handle_message(&msg1);
@@ -331,6 +347,7 @@ mod tests {
             peer_id,
             "192.168.1.42:9000",
             Capabilities::new().with_tcp(),
+            "",
         );
         manager.handle_message(&announce);
         let _ = rx.try_recv();

@@ -25,7 +25,7 @@ pub struct ObpClient {
 impl ObpClient {
     pub fn new(config: &Config) -> Self {
         Self {
-            base_url: config.obp_base_url.clone(),
+            base_url: config.obp_api_base_url.clone(),
             http_client: reqwest::Client::new(),
             auth_token: None,
             username: config.obp_username.clone(),

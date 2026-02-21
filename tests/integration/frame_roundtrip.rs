@@ -24,6 +24,7 @@ fn test_discovery_message_through_full_pipeline() {
         agent_id,
         "192.168.1.100:9000",
         Capabilities::new().with_tcp().with_obp().with_claude(),
+        "https://apisandbox.openbankproject.com",
     );
 
     // Encode message -> frame -> FSK -> demodulate -> decode frame -> decode message
@@ -45,8 +46,8 @@ fn test_multiple_message_types_through_pipeline() {
     let agent_id = Uuid::new_v4();
 
     for msg in [
-        DiscoveryMessage::announce(agent_id, "10.0.0.1:8080", Capabilities::new().with_tcp()),
-        DiscoveryMessage::ack(agent_id, "10.0.0.1:8080", Capabilities::new().with_http()),
+        DiscoveryMessage::announce(agent_id, "10.0.0.1:8080", Capabilities::new().with_tcp(), ""),
+        DiscoveryMessage::ack(agent_id, "10.0.0.1:8080", Capabilities::new().with_http(), ""),
         DiscoveryMessage::goodbye(agent_id),
     ] {
         let msg_bytes = codec::encode_message(&msg);

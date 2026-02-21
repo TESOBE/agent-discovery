@@ -26,9 +26,15 @@ pub enum ExplorationMsg {
     // --- Phase 1: Discover management endpoints ---
     ExploreStart {
         agent_name: String,
+        /// The OBP API base URL used by the initiating agent.
+        #[serde(default)]
+        obp_api_base_url: String,
     },
     ExploreAck {
         agent_name: String,
+        /// The OBP API base URL used by the responding agent.
+        #[serde(default)]
+        obp_api_base_url: String,
     },
     FoundManagementEndpoint {
         endpoint_id: String,

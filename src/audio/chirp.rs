@@ -750,22 +750,22 @@ pub fn data_down_chirp(sample_rate: u32) -> Vec<f32> {
     )
 }
 
-/// Encode a port number and capabilities byte into a binary chirp audio message.
+/// Encode a port number, capabilities byte, and next-hello interval into a binary chirp audio message.
 ///
 /// Message format:
-///   [preamble: 10101010] [sync: 1111] [port: 16 bits MSB] [caps: 8 bits] [checksum: 8 bits]
-///   Total: 44 bit slots = ~4.4 seconds of audio (100ms per bit slot)
-pub fn encode_chirp_message(port: u16, capabilities: u8, sample_rate: u32) -> Vec<f32> {
+///   [preamble: 10101010] [sync: 1111] [port: 16 bits MSB] [caps: 8 bits] [next_hello_mins: 8 bits] [checksum: 8 bits]
+///   Total: 52 bit slots = ~5.2 seconds of audio (100ms per bit slot)
+pub fn encode_chirp_message(port: u16, capabilities: u8, next_hello_mins: u8, sample_rate: u32) -> Vec<f32> {
     let up = data_up_chirp(sample_rate);
     let down = data_down_chirp(sample_rate);
     let gap_samples = (DATA_CHIRP_GAP * sample_rate as f32) as usize;
     let gap = vec![0.0f32; gap_samples];
 
-    // Build the bit sequence: preamble + sync + port (16) + caps (8) + checksum (8)
+    // Build the bit sequence: preamble + sync + port (16) + caps (8) + next_hello_mins (8) + checksum (8)
     let port_bytes = port.to_be_bytes();
-    let checksum = port_bytes[0] ^ port_bytes[1] ^ capabilities;
+    let checksum = port_bytes[0] ^ port_bytes[1] ^ capabilities ^ next_hello_mins;
 
-    let mut bits: Vec<u8> = Vec::with_capacity(44);
+    let mut bits: Vec<u8> = Vec::with_capacity(52);
     bits.extend_from_slice(&PREAMBLE);
     bits.extend_from_slice(&SYNC);
     // Port: 16 bits, MSB first
@@ -777,6 +777,10 @@ pub fn encode_chirp_message(port: u16, capabilities: u8, sample_rate: u32) -> Ve
     // Capabilities: 8 bits
     for bit_pos in (0..8).rev() {
         bits.push((capabilities >> bit_pos) & 1);
+    }
+    // Next hello interval in minutes: 8 bits
+    for bit_pos in (0..8).rev() {
+        bits.push((next_hello_mins >> bit_pos) & 1);
     }
     // Checksum: 8 bits
     for bit_pos in (0..8).rev() {
@@ -801,16 +805,16 @@ pub fn encode_chirp_message(port: u16, capabilities: u8, sample_rate: u32) -> Ve
 /// Decode a binary chirp message from audio samples.
 ///
 /// Correlates each bit-slot against up-chirp and down-chirp templates,
-/// looks for the preamble+sync pattern, then extracts port and capabilities.
-pub fn decode_chirp_message(samples: &[f32], sample_rate: u32) -> Option<(u16, u8)> {
+/// looks for the preamble+sync pattern, then extracts port, capabilities, and next_hello_mins.
+pub fn decode_chirp_message(samples: &[f32], sample_rate: u32) -> Option<(u16, u8, u8)> {
     let up_template = data_up_chirp(sample_rate);
     let down_template = data_down_chirp(sample_rate);
     let chirp_len = up_template.len();
     let gap_samples = (DATA_CHIRP_GAP * sample_rate as f32) as usize;
     let slot_len = chirp_len + gap_samples;
 
-    // We need at least 44 bit slots
-    let needed = 44 * slot_len;
+    // We need at least 52 bit slots
+    let needed = 52 * slot_len;
     if samples.len() < needed / 2 {
         return None;
     }
@@ -856,9 +860,9 @@ fn try_decode_at_offset(
     down_energy: f32,
     slot_len: usize,
     chirp_len: usize,
-) -> Option<(u16, u8)> {
+) -> Option<(u16, u8, u8)> {
     // Decode enough bits for preamble + sync + data
-    let total_bits = 44;
+    let total_bits = 52;
     let needed = start + total_bits * slot_len;
     if samples.len() < needed {
         return None;
@@ -912,20 +916,21 @@ fn try_decode_at_offset(
 
     // Extract data bits (starting at bit 12)
     let data_bits = &bits[12..];
-    // data_bits: 16 (port) + 8 (caps) + 8 (checksum) = 32 bits
+    // data_bits: 16 (port) + 8 (caps) + 8 (next_hello_mins) + 8 (checksum) = 40 bits
 
     let port_hi = bits_to_byte(&data_bits[0..8]);
     let port_lo = bits_to_byte(&data_bits[8..16]);
     let caps = bits_to_byte(&data_bits[16..24]);
-    let checksum = bits_to_byte(&data_bits[24..32]);
+    let next_hello_mins = bits_to_byte(&data_bits[24..32]);
+    let checksum = bits_to_byte(&data_bits[32..40]);
 
-    let expected_checksum = port_hi ^ port_lo ^ caps;
+    let expected_checksum = port_hi ^ port_lo ^ caps ^ next_hello_mins;
     if checksum != expected_checksum {
         return None;
     }
 
     let port = u16::from_be_bytes([port_hi, port_lo]);
-    Some((port, caps))
+    Some((port, caps, next_hello_mins))
 }
 
 /// Convert 8 bits (as u8 array of 0/1) to a byte.
@@ -947,12 +952,12 @@ fn bits_to_byte(bits: &[u8]) -> u8 {
 /// by comparing the average peak frequency in the first half vs second
 /// half of each bit slot. This is far more robust through acoustic paths
 /// where distortion and noise break template correlation.
-pub fn decode_chirp_message_sweep(samples: &[f32], sample_rate: u32) -> Option<(u16, u8)> {
+pub fn decode_chirp_message_sweep(samples: &[f32], sample_rate: u32) -> Option<(u16, u8, u8)> {
     let chirp_samples = (DATA_CHIRP_DURATION * sample_rate as f32) as usize;
     let gap_samples = (DATA_CHIRP_GAP * sample_rate as f32) as usize;
     let slot_samples = chirp_samples + gap_samples;
 
-    let total_bits = 44;
+    let total_bits = 52;
     let needed = total_bits * slot_samples;
     if samples.len() < needed / 2 {
         return None;
@@ -1077,7 +1082,7 @@ fn try_decode_sweep_at_frame(
     slot_samples: usize,
     chirp_samples: usize,
     total_bits: usize,
-) -> Option<(u16, u8)> {
+) -> Option<(u16, u8, u8)> {
     let start_sample = start_frame * SWEEP_HOP_SIZE;
 
     let mut bits = Vec::with_capacity(total_bits);
@@ -1119,15 +1124,430 @@ fn try_decode_sweep_at_frame(
     let port_hi = bits_to_byte(&data_bits[0..8]);
     let port_lo = bits_to_byte(&data_bits[8..16]);
     let caps = bits_to_byte(&data_bits[16..24]);
-    let checksum = bits_to_byte(&data_bits[24..32]);
+    let next_hello_mins = bits_to_byte(&data_bits[24..32]);
+    let checksum = bits_to_byte(&data_bits[32..40]);
 
-    let expected_checksum = port_hi ^ port_lo ^ caps;
+    let expected_checksum = port_hi ^ port_lo ^ caps ^ next_hello_mins;
     if checksum != expected_checksum {
         return None;
     }
 
     let port = u16::from_be_bytes([port_hi, port_lo]);
-    Some((port, caps))
+    Some((port, caps, next_hello_mins))
+}
+
+// ---------------------------------------------------------------------------
+// URL chirp messaging
+// ---------------------------------------------------------------------------
+
+/// Distinct preamble for URL chirp bursts (inverted from hello's 10101010).
+/// Ensures decoders can distinguish a hello message from a URL burst.
+const URL_PREAMBLE: [u8; 8] = [0, 1, 0, 1, 0, 1, 0, 1];
+
+/// Encode a URL string into a binary chirp audio burst.
+///
+/// Format: `[url_preamble: 8] [sync: 4] [url_length: 8] [url_bytes: N×8] [checksum: 8]`
+///
+/// Uses the same up/down data chirps as hello messages but with the
+/// inverted `URL_PREAMBLE` so decoders can tell them apart.
+///
+/// Checksum: XOR of `url_length` and all URL bytes.
+pub fn encode_chirp_url(url: &str, sample_rate: u32) -> Vec<f32> {
+    let url_bytes = url.as_bytes();
+    if url_bytes.len() > 255 {
+        // URL too long for 1-byte length field — truncate silently
+        return encode_chirp_url(&url[..255], sample_rate);
+    }
+
+    let up = data_up_chirp(sample_rate);
+    let down = data_down_chirp(sample_rate);
+    let gap_samples = (DATA_CHIRP_GAP * sample_rate as f32) as usize;
+    let gap = vec![0.0f32; gap_samples];
+
+    let url_len = url_bytes.len() as u8;
+    let mut checksum = url_len;
+    for &b in url_bytes {
+        checksum ^= b;
+    }
+
+    // Build bit sequence: preamble(8) + sync(4) + url_len(8) + url_bytes(N*8) + checksum(8)
+    let total_bits = 8 + 4 + 8 + url_bytes.len() * 8 + 8;
+    let mut bits: Vec<u8> = Vec::with_capacity(total_bits);
+    bits.extend_from_slice(&URL_PREAMBLE);
+    bits.extend_from_slice(&SYNC);
+
+    // URL length: 8 bits
+    for bit_pos in (0..8).rev() {
+        bits.push((url_len >> bit_pos) & 1);
+    }
+    // URL bytes
+    for &byte in url_bytes {
+        for bit_pos in (0..8).rev() {
+            bits.push((byte >> bit_pos) & 1);
+        }
+    }
+    // Checksum: 8 bits
+    for bit_pos in (0..8).rev() {
+        bits.push((checksum >> bit_pos) & 1);
+    }
+
+    // Encode each bit as up-chirp (1) or down-chirp (0) + gap
+    let slot_samples = up.len() + gap_samples;
+    let mut samples = Vec::with_capacity(bits.len() * slot_samples);
+    for &bit in &bits {
+        if bit == 1 {
+            samples.extend_from_slice(&up);
+        } else {
+            samples.extend_from_slice(&down);
+        }
+        samples.extend_from_slice(&gap);
+    }
+
+    samples
+}
+
+/// Decode a URL from a binary chirp audio burst using correlation.
+///
+/// Returns the decoded URL string, or `None` if no valid URL burst is found.
+pub fn decode_chirp_url(samples: &[f32], sample_rate: u32) -> Option<String> {
+    let up_template = data_up_chirp(sample_rate);
+    let down_template = data_down_chirp(sample_rate);
+    let chirp_len = up_template.len();
+    let gap_samples = (DATA_CHIRP_GAP * sample_rate as f32) as usize;
+    let slot_len = chirp_len + gap_samples;
+
+    // We need at least preamble(8) + sync(4) + url_len(8) + checksum(8) = 28 slots
+    let min_slots = 28;
+    if samples.len() < min_slots * slot_len / 2 {
+        return None;
+    }
+
+    let up_energy: f32 = up_template.iter().map(|s| s * s).sum();
+    let down_energy: f32 = down_template.iter().map(|s| s * s).sum();
+    if up_energy == 0.0 || down_energy == 0.0 {
+        return None;
+    }
+
+    let search_step = (chirp_len / 8).max(1);
+    let max_search = samples.len().saturating_sub(min_slots * slot_len).min(slot_len * 12);
+
+    for start_offset in (0..=max_search).step_by(search_step) {
+        if let Some(result) = try_decode_url_at_offset(
+            samples, start_offset, &up_template, &down_template,
+            up_energy, down_energy, slot_len, chirp_len,
+        ) {
+            return Some(result);
+        }
+    }
+
+    None
+}
+
+/// Try to decode a URL chirp message at a specific sample offset.
+fn try_decode_url_at_offset(
+    samples: &[f32],
+    start: usize,
+    up_template: &[f32],
+    down_template: &[f32],
+    up_energy: f32,
+    down_energy: f32,
+    slot_len: usize,
+    chirp_len: usize,
+) -> Option<String> {
+    // First decode preamble + sync + url_len = 20 bits
+    let header_bits = 20;
+    if samples.len() < start + header_bits * slot_len {
+        return None;
+    }
+
+    let mut bits = Vec::new();
+    let mut slot = 0;
+
+    // Decode header bits
+    for _ in 0..header_bits {
+        let offset = start + slot * slot_len;
+        if offset + chirp_len > samples.len() {
+            return None;
+        }
+        let window = &samples[offset..offset + chirp_len];
+
+        let up_corr = {
+            let cross: f32 = window.iter().zip(up_template.iter()).map(|(a, b)| a * b).sum();
+            let win_energy: f32 = window.iter().map(|s| s * s).sum();
+            if win_energy > 0.0 { cross / (win_energy.sqrt() * up_energy.sqrt()) } else { 0.0 }
+        };
+        let down_corr = {
+            let cross: f32 = window.iter().zip(down_template.iter()).map(|(a, b)| a * b).sum();
+            let win_energy: f32 = window.iter().map(|s| s * s).sum();
+            if win_energy > 0.0 { cross / (win_energy.sqrt() * down_energy.sqrt()) } else { 0.0 }
+        };
+
+        if up_corr.max(down_corr) < DATA_DETECTION_THRESHOLD {
+            return None;
+        }
+        bits.push(if up_corr > down_corr { 1u8 } else { 0u8 });
+        slot += 1;
+    }
+
+    // Verify URL preamble
+    if bits[0..8] != URL_PREAMBLE {
+        return None;
+    }
+    if bits[8..12] != SYNC {
+        return None;
+    }
+
+    let url_len = bits_to_byte(&bits[12..20]) as usize;
+    if url_len == 0 {
+        return None;
+    }
+
+    // Now decode url_bytes(url_len*8) + checksum(8) more bits
+    let remaining_bits = url_len * 8 + 8;
+    let total_needed = start + (header_bits + remaining_bits) * slot_len;
+    if samples.len() < total_needed {
+        return None;
+    }
+
+    for _ in 0..remaining_bits {
+        let offset = start + slot * slot_len;
+        if offset + chirp_len > samples.len() {
+            return None;
+        }
+        let window = &samples[offset..offset + chirp_len];
+
+        let up_corr = {
+            let cross: f32 = window.iter().zip(up_template.iter()).map(|(a, b)| a * b).sum();
+            let win_energy: f32 = window.iter().map(|s| s * s).sum();
+            if win_energy > 0.0 { cross / (win_energy.sqrt() * up_energy.sqrt()) } else { 0.0 }
+        };
+        let down_corr = {
+            let cross: f32 = window.iter().zip(down_template.iter()).map(|(a, b)| a * b).sum();
+            let win_energy: f32 = window.iter().map(|s| s * s).sum();
+            if win_energy > 0.0 { cross / (win_energy.sqrt() * down_energy.sqrt()) } else { 0.0 }
+        };
+
+        if up_corr.max(down_corr) < DATA_DETECTION_THRESHOLD {
+            return None;
+        }
+        bits.push(if up_corr > down_corr { 1u8 } else { 0u8 });
+        slot += 1;
+    }
+
+    // Extract URL bytes and checksum
+    let data_start = 20; // after preamble + sync + url_len
+    let mut url_bytes = Vec::with_capacity(url_len);
+    for i in 0..url_len {
+        let byte_start = data_start + i * 8;
+        url_bytes.push(bits_to_byte(&bits[byte_start..byte_start + 8]));
+    }
+    let checksum = bits_to_byte(&bits[data_start + url_len * 8..data_start + url_len * 8 + 8]);
+
+    let mut expected_checksum = url_len as u8;
+    for &b in &url_bytes {
+        expected_checksum ^= b;
+    }
+    if checksum != expected_checksum {
+        return None;
+    }
+
+    String::from_utf8(url_bytes).ok()
+}
+
+/// Decode a URL from a binary chirp burst using spectrogram analysis.
+///
+/// Like `decode_chirp_url` but uses spectrogram peak-frequency comparison
+/// (same technique as `decode_chirp_message_sweep`) for robustness through
+/// acoustic paths.
+pub fn decode_chirp_url_sweep(samples: &[f32], sample_rate: u32) -> Option<String> {
+    let chirp_samples = (DATA_CHIRP_DURATION * sample_rate as f32) as usize;
+    let gap_samples = (DATA_CHIRP_GAP * sample_rate as f32) as usize;
+    let slot_samples = chirp_samples + gap_samples;
+
+    // Minimum: preamble(8) + sync(4) + url_len(8) + 1 byte(8) + checksum(8) = 36 slots
+    let min_bits = 36;
+    if samples.len() < min_bits * slot_samples / 2 {
+        return None;
+    }
+
+    // Compute spectrogram peak frequencies
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(SWEEP_FFT_SIZE);
+
+    let freq_per_bin = sample_rate as f32 / SWEEP_FFT_SIZE as f32;
+    let band_low_bin = (1300.0 / freq_per_bin).ceil() as usize;
+    let band_high_bin = (2700.0 / freq_per_bin).floor() as usize;
+    let max_bin = (SWEEP_FFT_SIZE / 2).saturating_sub(1);
+    let search_high = band_high_bin.min(max_bin);
+
+    if band_low_bin >= search_high {
+        return None;
+    }
+
+    let num_frames = samples.len().saturating_sub(SWEEP_FFT_SIZE) / SWEEP_HOP_SIZE + 1;
+    if num_frames < 10 {
+        return None;
+    }
+
+    let hanning: Vec<f32> = (0..SWEEP_FFT_SIZE)
+        .map(|i| 0.5 * (1.0 - (TAU * i as f32 / SWEEP_FFT_SIZE as f32).cos()))
+        .collect();
+
+    let mut peak_freqs = Vec::with_capacity(num_frames);
+    let mut scratch = vec![Complex { re: 0.0f32, im: 0.0 }; fft.get_inplace_scratch_len()];
+
+    for frame_idx in 0..num_frames {
+        let start = frame_idx * SWEEP_HOP_SIZE;
+        if start + SWEEP_FFT_SIZE > samples.len() {
+            break;
+        }
+        let frame = &samples[start..start + SWEEP_FFT_SIZE];
+
+        let mut buffer: Vec<Complex<f32>> = frame
+            .iter()
+            .zip(hanning.iter())
+            .map(|(&s, &w)| Complex { re: s * w, im: 0.0 })
+            .collect();
+
+        fft.process_with_scratch(&mut buffer, &mut scratch);
+
+        let mut max_mag = 0.0f32;
+        let mut max_bin_idx = band_low_bin;
+        for bin in band_low_bin..=search_high {
+            let mag = buffer[bin].norm();
+            if mag > max_mag {
+                max_mag = mag;
+                max_bin_idx = bin;
+            }
+        }
+
+        let refined_freq = if max_bin_idx > band_low_bin && max_bin_idx < search_high {
+            let alpha = buffer[max_bin_idx - 1].norm();
+            let beta = buffer[max_bin_idx].norm();
+            let gamma = buffer[max_bin_idx + 1].norm();
+            let denom = alpha - 2.0 * beta + gamma;
+            if denom.abs() > 1e-10 {
+                let delta = 0.5 * (alpha - gamma) / denom;
+                (max_bin_idx as f32 + delta) * freq_per_bin
+            } else {
+                max_bin_idx as f32 * freq_per_bin
+            }
+        } else {
+            max_bin_idx as f32 * freq_per_bin
+        };
+
+        peak_freqs.push(refined_freq);
+    }
+
+    let actual_frames = peak_freqs.len();
+    let approx_frames_per_slot = slot_samples / SWEEP_HOP_SIZE;
+    if approx_frames_per_slot < 4 || chirp_samples < SWEEP_HOP_SIZE * 4 {
+        return None;
+    }
+
+    let search_step = (approx_frames_per_slot / 4).max(1);
+
+    // We need to try multiple start frames; for each, decode header first
+    // to learn url_len, then decode the rest.
+    let max_search = actual_frames.saturating_sub(min_bits * approx_frames_per_slot);
+
+    for start_frame in (0..=max_search).step_by(search_step) {
+        if let Some(result) = try_decode_url_sweep_at_frame(
+            &peak_freqs, start_frame, slot_samples, chirp_samples,
+        ) {
+            return Some(result);
+        }
+    }
+
+    None
+}
+
+/// Try to decode a URL chirp at a specific spectrogram frame offset.
+fn try_decode_url_sweep_at_frame(
+    peak_freqs: &[f32],
+    start_frame: usize,
+    slot_samples: usize,
+    chirp_samples: usize,
+) -> Option<String> {
+    let start_sample = start_frame * SWEEP_HOP_SIZE;
+
+    // First decode 20 header bits: preamble(8) + sync(4) + url_len(8)
+    let header_bits = 20;
+    let mut bits = Vec::new();
+
+    for i in 0..header_bits {
+        let slot_start_sample = start_sample + i * slot_samples;
+        let chirp_mid_sample = slot_start_sample + chirp_samples / 2;
+        let chirp_end_sample = slot_start_sample + chirp_samples;
+
+        let first_start = slot_start_sample / SWEEP_HOP_SIZE;
+        let mid = chirp_mid_sample / SWEEP_HOP_SIZE;
+        let end = chirp_end_sample / SWEEP_HOP_SIZE;
+
+        if end > peak_freqs.len() || mid <= first_start || end <= mid {
+            return None;
+        }
+
+        let first_avg: f32 = peak_freqs[first_start..mid].iter().sum::<f32>() / (mid - first_start) as f32;
+        let second_avg: f32 = peak_freqs[mid..end].iter().sum::<f32>() / (end - mid) as f32;
+
+        bits.push(if second_avg > first_avg { 1u8 } else { 0u8 });
+    }
+
+    // Verify URL preamble
+    if bits[0..8] != URL_PREAMBLE {
+        return None;
+    }
+    if bits[8..12] != SYNC {
+        return None;
+    }
+
+    let url_len = bits_to_byte(&bits[12..20]) as usize;
+    if url_len == 0 {
+        return None;
+    }
+
+    // Decode remaining: url_bytes(url_len*8) + checksum(8)
+    let remaining_bits = url_len * 8 + 8;
+    let total_bits = header_bits + remaining_bits;
+
+    for i in header_bits..total_bits {
+        let slot_start_sample = start_sample + i * slot_samples;
+        let chirp_mid_sample = slot_start_sample + chirp_samples / 2;
+        let chirp_end_sample = slot_start_sample + chirp_samples;
+
+        let first_start = slot_start_sample / SWEEP_HOP_SIZE;
+        let mid = chirp_mid_sample / SWEEP_HOP_SIZE;
+        let end = chirp_end_sample / SWEEP_HOP_SIZE;
+
+        if end > peak_freqs.len() || mid <= first_start || end <= mid {
+            return None;
+        }
+
+        let first_avg: f32 = peak_freqs[first_start..mid].iter().sum::<f32>() / (mid - first_start) as f32;
+        let second_avg: f32 = peak_freqs[mid..end].iter().sum::<f32>() / (end - mid) as f32;
+
+        bits.push(if second_avg > first_avg { 1u8 } else { 0u8 });
+    }
+
+    // Extract URL bytes and checksum
+    let data_start = 20;
+    let mut url_bytes = Vec::with_capacity(url_len);
+    for i in 0..url_len {
+        let byte_start = data_start + i * 8;
+        url_bytes.push(bits_to_byte(&bits[byte_start..byte_start + 8]));
+    }
+    let checksum = bits_to_byte(&bits[data_start + url_len * 8..data_start + url_len * 8 + 8]);
+
+    let mut expected_checksum = url_len as u8;
+    for &b in &url_bytes {
+        expected_checksum ^= b;
+    }
+    if checksum != expected_checksum {
+        return None;
+    }
+
+    String::from_utf8(url_bytes).ok()
 }
 
 #[cfg(test)]
@@ -1238,24 +1658,26 @@ mod tests {
     fn test_chirp_message_roundtrip() {
         let port = 7312u16;
         let caps = 0x0Bu8;
-        let samples = encode_chirp_message(port, caps, SAMPLE_RATE);
+        let next_hello = 10u8;
+        let samples = encode_chirp_message(port, caps, next_hello, SAMPLE_RATE);
         assert!(!samples.is_empty());
 
         let result = decode_chirp_message(&samples, SAMPLE_RATE);
-        assert_eq!(result, Some((port, caps)), "Roundtrip decode should match");
+        assert_eq!(result, Some((port, caps, next_hello)), "Roundtrip decode should match");
     }
 
     #[test]
     fn test_chirp_message_various_ports() {
-        for &(port, caps) in &[(80, 0x01), (9001, 0x0F), (65535, 0xFF), (0, 0x00)] {
-            let samples = encode_chirp_message(port, caps, SAMPLE_RATE);
+        for &(port, caps, nhm) in &[(80, 0x01, 1), (9001, 0x0F, 10), (65535, 0xFF, 255), (0, 0x00, 0)] {
+            let samples = encode_chirp_message(port, caps, nhm, SAMPLE_RATE);
             let result = decode_chirp_message(&samples, SAMPLE_RATE);
             assert_eq!(
                 result,
-                Some((port, caps)),
-                "Failed for port={} caps={}",
+                Some((port, caps, nhm)),
+                "Failed for port={} caps={} next_hello_mins={}",
                 port,
-                caps
+                caps,
+                nhm
             );
         }
     }
@@ -1264,7 +1686,8 @@ mod tests {
     fn test_chirp_message_with_leading_silence() {
         let port = 7312u16;
         let caps = 0x0Bu8;
-        let msg = encode_chirp_message(port, caps, SAMPLE_RATE);
+        let next_hello = 5u8;
+        let msg = encode_chirp_message(port, caps, next_hello, SAMPLE_RATE);
 
         // Pad with silence before the message
         let mut padded = vec![0.0f32; SAMPLE_RATE as usize]; // 1 second of silence
@@ -1272,14 +1695,15 @@ mod tests {
 
         // The sweep-based decoder (used in production) handles leading silence
         let result = decode_chirp_message_sweep(&padded, SAMPLE_RATE);
-        assert_eq!(result, Some((port, caps)), "Sweep decode should work with leading silence");
+        assert_eq!(result, Some((port, caps, next_hello)), "Sweep decode should work with leading silence");
     }
 
     #[test]
     fn test_chirp_message_with_noise() {
         let port = 9001u16;
         let caps = 0x07u8;
-        let samples = encode_chirp_message(port, caps, SAMPLE_RATE);
+        let next_hello = 1u8;
+        let samples = encode_chirp_message(port, caps, next_hello, SAMPLE_RATE);
 
         // Add mild noise
         let noisy: Vec<f32> = samples
@@ -1292,7 +1716,7 @@ mod tests {
             .collect();
 
         let result = decode_chirp_message(&noisy, SAMPLE_RATE);
-        assert_eq!(result, Some((port, caps)), "Should decode with mild noise");
+        assert_eq!(result, Some((port, caps, next_hello)), "Should decode with mild noise");
     }
 
     #[test]
@@ -1708,24 +2132,26 @@ mod tests {
     fn test_sweep_decode_roundtrip() {
         let port = 7312u16;
         let caps = 0x0Bu8;
-        let samples = encode_chirp_message(port, caps, SAMPLE_RATE);
+        let next_hello = 10u8;
+        let samples = encode_chirp_message(port, caps, next_hello, SAMPLE_RATE);
         assert!(!samples.is_empty());
 
         let result = decode_chirp_message_sweep(&samples, SAMPLE_RATE);
-        assert_eq!(result, Some((port, caps)), "Sweep decode roundtrip should match");
+        assert_eq!(result, Some((port, caps, next_hello)), "Sweep decode roundtrip should match");
     }
 
     #[test]
     fn test_sweep_decode_various_ports() {
-        for &(port, caps) in &[(80, 0x01), (9001, 0x0F), (65535, 0xFF), (0, 0x00)] {
-            let samples = encode_chirp_message(port, caps, SAMPLE_RATE);
+        for &(port, caps, nhm) in &[(80, 0x01, 1), (9001, 0x0F, 10), (65535, 0xFF, 255), (0, 0x00, 0)] {
+            let samples = encode_chirp_message(port, caps, nhm, SAMPLE_RATE);
             let result = decode_chirp_message_sweep(&samples, SAMPLE_RATE);
             assert_eq!(
                 result,
-                Some((port, caps)),
-                "Sweep decode failed for port={} caps={}",
+                Some((port, caps, nhm)),
+                "Sweep decode failed for port={} caps={} next_hello_mins={}",
                 port,
-                caps
+                caps,
+                nhm
             );
         }
     }
@@ -1734,20 +2160,22 @@ mod tests {
     fn test_sweep_decode_with_leading_silence() {
         let port = 7312u16;
         let caps = 0x0Bu8;
-        let msg = encode_chirp_message(port, caps, SAMPLE_RATE);
+        let next_hello = 5u8;
+        let msg = encode_chirp_message(port, caps, next_hello, SAMPLE_RATE);
 
         let mut padded = vec![0.0f32; SAMPLE_RATE as usize]; // 1 second of silence
         padded.extend_from_slice(&msg);
 
         let result = decode_chirp_message_sweep(&padded, SAMPLE_RATE);
-        assert_eq!(result, Some((port, caps)), "Sweep decode should work with leading silence");
+        assert_eq!(result, Some((port, caps, next_hello)), "Sweep decode should work with leading silence");
     }
 
     #[test]
     fn test_sweep_decode_with_noise() {
         let port = 9001u16;
         let caps = 0x07u8;
-        let samples = encode_chirp_message(port, caps, SAMPLE_RATE);
+        let next_hello = 1u8;
+        let samples = encode_chirp_message(port, caps, next_hello, SAMPLE_RATE);
 
         let noisy: Vec<f32> = samples
             .iter()
@@ -1759,7 +2187,7 @@ mod tests {
             .collect();
 
         let result = decode_chirp_message_sweep(&noisy, SAMPLE_RATE);
-        assert_eq!(result, Some((port, caps)), "Sweep decode should work with mild noise");
+        assert_eq!(result, Some((port, caps, next_hello)), "Sweep decode should work with mild noise");
     }
 
     #[test]
@@ -1775,5 +2203,77 @@ mod tests {
             &padded, 600.0, 3600.0, SAMPLE_RATE, 0.10, 0.20, 500.0,
         );
         assert!(result.is_some(), "Should detect chirp in padded signal");
+    }
+
+    // --- URL chirp messaging tests ---
+
+    #[test]
+    fn test_url_chirp_roundtrip() {
+        let url = "https://apisandbox.openbankproject.com";
+        let samples = encode_chirp_url(url, SAMPLE_RATE);
+        assert!(!samples.is_empty());
+
+        let result = decode_chirp_url(&samples, SAMPLE_RATE);
+        assert_eq!(result.as_deref(), Some(url), "URL roundtrip decode should match");
+    }
+
+    #[test]
+    fn test_url_chirp_sweep_roundtrip() {
+        let url = "https://apisandbox.openbankproject.com";
+        let samples = encode_chirp_url(url, SAMPLE_RATE);
+
+        let result = decode_chirp_url_sweep(&samples, SAMPLE_RATE);
+        assert_eq!(result.as_deref(), Some(url), "URL sweep roundtrip decode should match");
+    }
+
+    #[test]
+    fn test_url_chirp_with_leading_silence() {
+        let url = "https://example.com/obp";
+        let msg = encode_chirp_url(url, SAMPLE_RATE);
+
+        let mut padded = vec![0.0f32; SAMPLE_RATE as usize]; // 1 second of silence
+        padded.extend_from_slice(&msg);
+
+        let result = decode_chirp_url_sweep(&padded, SAMPLE_RATE);
+        assert_eq!(result.as_deref(), Some(url), "URL sweep decode should work with leading silence");
+    }
+
+    #[test]
+    fn test_url_chirp_with_noise() {
+        let url = "https://test.openbankproject.com";
+        let samples = encode_chirp_url(url, SAMPLE_RATE);
+
+        let noisy: Vec<f32> = samples
+            .iter()
+            .enumerate()
+            .map(|(i, &s)| {
+                let noise = (i as f32 * 7.3).sin() * 0.05;
+                s + noise
+            })
+            .collect();
+
+        let result = decode_chirp_url(&noisy, SAMPLE_RATE);
+        assert_eq!(result.as_deref(), Some(url), "URL decode should work with mild noise");
+    }
+
+    #[test]
+    fn test_url_chirp_not_confused_with_hello() {
+        // A hello message should NOT decode as a URL
+        let hello_samples = encode_chirp_message(7312, 0x0B, 10, SAMPLE_RATE);
+        let result = decode_chirp_url(&hello_samples, SAMPLE_RATE);
+        assert!(result.is_none(), "Hello message should not decode as URL");
+
+        // A URL message should NOT decode as a hello
+        let url_samples = encode_chirp_url("https://example.com", SAMPLE_RATE);
+        let result = decode_chirp_message(&url_samples, SAMPLE_RATE);
+        assert!(result.is_none(), "URL message should not decode as hello");
+    }
+
+    #[test]
+    fn test_url_chirp_short_url() {
+        let url = "http://x.co";
+        let samples = encode_chirp_url(url, SAMPLE_RATE);
+        let result = decode_chirp_url(&samples, SAMPLE_RATE);
+        assert_eq!(result.as_deref(), Some(url));
     }
 }
