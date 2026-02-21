@@ -490,7 +490,7 @@ pub async fn diagnose_audio_to_signal(config: &Config) -> Result<()> {
                 Err(e) => println!("Failed to post to signal channel: {}", e),
             }
         }
-        Err(e) => println!("OBP auth failed (skipping signal post): {}", e),
+        Err(e) => println!("OBP auth failed (skipping signal post): {:?}", e),
     }
 
     Ok(())
