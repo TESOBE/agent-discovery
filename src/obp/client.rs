@@ -45,7 +45,7 @@ impl ObpClient {
             self.username, self.password, self.consumer_key
         );
 
-        let url = format!("{}/my/logins/direct", self.base_url);
+        let url = format!("{}/obp/v6.0.0/my/logins/direct", self.base_url);
         let response = self
             .http_client
             .post(&url)
