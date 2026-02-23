@@ -174,6 +174,46 @@ AGENT_NAME=mumma2 AGENT_LISTEN_PORT=7313 cargo run -- run
 AGENT_NAME=mumma3 AGENT_LISTEN_PORT=7314 cargo run -- run
 ```
 
+## Raspberry Pi — Auto-Start at Boot
+
+To run the agent as a service that starts automatically on boot:
+
+1. **Build the release binary** (do this once, before installing the service):
+   ```
+   cargo build --release
+   ```
+
+2. **Install the systemd service:**
+   ```
+   sudo bash install-service.sh
+   ```
+
+This installs a systemd service that:
+- Derives a stable agent name from the first 12 hex characters of the SHA-256 hash of the Pi's MAC address (so each Pi gets a unique, deterministic identity)
+- Loads your `.env` file for API keys and other config
+- Waits for the network to be up before starting
+- Adds the `audio` group so the agent can access mic/speaker
+- Auto-restarts on crash (5 second delay)
+- Logs to journald
+
+**Useful commands:**
+
+```
+sudo systemctl status agent-discovery      # check if running
+sudo journalctl -u agent-discovery -f      # follow logs
+sudo systemctl restart agent-discovery     # restart
+sudo systemctl stop agent-discovery        # stop
+sudo systemctl disable agent-discovery     # disable auto-start
+```
+
+You can also run the startup script manually without installing the service:
+
+```
+bash start-agent.sh            # auto-detect network interface
+bash start-agent.sh wlan0      # use Wi-Fi MAC
+bash start-agent.sh eth0       # use Ethernet MAC
+```
+
 ## Other Commands
 
 ```
