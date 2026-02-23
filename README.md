@@ -228,3 +228,9 @@ cargo run -- test-roundtrip        # Play and decode via mic
 ```
 cargo test
 ```
+
+## Logs
+
+```
+sudo journalctl -u agent-discovery -f      # follow logs in real time
+```

@@ -21,6 +21,7 @@ tracing-appender = "0.2"
 anyhow = "1"
 thiserror = "2"
 crossbeam-channel = "0.5"
+regex-lite = "0.1"
 socket2 = { version = "0.5", features = ["all"] }
 
 [dev-dependencies]

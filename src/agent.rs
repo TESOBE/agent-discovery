@@ -232,6 +232,14 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
 
     tracing::info!("TCP listener ready on port {}", actual_port);
 
+    // Auto-detect USB audio devices and write ~/.asoundrc before opening audio.
+    // This ensures card names (not numbers) are used, so re-plugging USB
+    // devices into different ports doesn't break audio.
+    match crate::audio::device::detect_audio() {
+        Ok(()) => tracing::info!("Audio device detection completed"),
+        Err(e) => tracing::warn!("Audio device detection failed: {}. Using existing ~/.asoundrc.", e),
+    }
+
     // Set up audio engine
     let audio_engine = match AudioEngine::new() {
         Ok(engine) => {

@@ -496,6 +496,314 @@ pub async fn diagnose_audio_to_signal(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// An ALSA device parsed from `arecord -l` or `aplay -l` output.
+#[derive(Debug, Clone)]
+struct AlsaDevice {
+    card_num: u32,
+    card_name: String,
+    device_num: u32,
+    description: String,
+}
+
+impl AlsaDevice {
+    /// ALSA device string suitable for aplay/arecord -D flag.
+    fn plughw(&self) -> String {
+        format!("plughw:{},{}", self.card_name, self.device_num)
+    }
+}
+
+/// Parse `arecord -l` or `aplay -l` output into a list of ALSA devices.
+/// Lines look like: `card 2: UACDemoV10 [UACDemoV1.0], device 0: USB Audio [USB Audio]`
+fn parse_alsa_devices(output: &str) -> Vec<AlsaDevice> {
+    let re_card = regex_lite::Regex::new(
+        r"^card (\d+): (\S+) \[([^\]]*)\], device (\d+):"
+    ).expect("valid regex");
+
+    let mut devices = Vec::new();
+    for line in output.lines() {
+        if let Some(caps) = re_card.captures(line) {
+            let card_num: u32 = caps[1].parse().unwrap_or(0);
+            // Skip card 0 (typically onboard/dummy on Pi)
+            if card_num == 0 {
+                continue;
+            }
+            devices.push(AlsaDevice {
+                card_num,
+                card_name: caps[2].to_string(),
+                device_num: caps[4].parse().unwrap_or(0),
+                description: caps[3].to_string(),
+            });
+        }
+    }
+    devices
+}
+
+/// Compute RMS of raw S16_LE bytes interpreted as mono i16 samples.
+fn rms_from_raw_bytes(bytes: &[u8]) -> f64 {
+    if bytes.len() < 2 {
+        return 0.0;
+    }
+    let samples: Vec<f64> = bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            let val = i16::from_le_bytes([pair[0], pair[1]]);
+            val as f64 / i16::MAX as f64
+        })
+        .collect();
+    if samples.is_empty() {
+        return 0.0;
+    }
+    let sum_sq: f64 = samples.iter().map(|s| s * s).sum();
+    (sum_sq / samples.len() as f64).sqrt()
+}
+
+/// Generate 1 second of 1 kHz sine wave as raw S16_LE bytes at 44100 Hz mono.
+fn generate_sine_tone_bytes(freq_hz: f64, duration_secs: f64, sample_rate: u32) -> Vec<u8> {
+    let num_samples = (sample_rate as f64 * duration_secs) as usize;
+    let mut bytes = Vec::with_capacity(num_samples * 2);
+    let tau = std::f64::consts::TAU;
+    for i in 0..num_samples {
+        let t = i as f64 / sample_rate as f64;
+        let sample = (tau * freq_hz * t).sin() * 0.8; // 80% amplitude
+        let i16_val = (sample * i16::MAX as f64) as i16;
+        bytes.extend_from_slice(&i16_val.to_le_bytes());
+    }
+    bytes
+}
+
+/// Auto-detect USB audio devices by enumerating ALSA devices, testing mics
+/// for ambient noise, testing speaker-mic pairs with a loopback tone, and
+/// writing `~/.asoundrc` with the working pair using card names.
+pub fn detect_audio() -> Result<()> {
+    use std::process::{Command, Stdio};
+
+    println!("=== Audio Device Detection ===\n");
+
+    // Step 1: Enumerate ALSA devices
+    println!("Step 1: Enumerating ALSA devices...");
+
+    let capture_output = Command::new("arecord")
+        .args(["-l"])
+        .output()
+        .context("Failed to run arecord -l — is alsa-utils installed?")?;
+    let capture_list = String::from_utf8_lossy(&capture_output.stdout);
+
+    let playback_output = Command::new("aplay")
+        .args(["-l"])
+        .output()
+        .context("Failed to run aplay -l — is alsa-utils installed?")?;
+    let playback_list = String::from_utf8_lossy(&playback_output.stdout);
+
+    let capture_devices = parse_alsa_devices(&capture_list);
+    let playback_devices = parse_alsa_devices(&playback_list);
+
+    println!("  Capture devices (skipping card 0):");
+    for dev in &capture_devices {
+        println!("    card {}: {} [{}] device {} -> {}",
+            dev.card_num, dev.card_name, dev.description, dev.device_num, dev.plughw());
+    }
+    println!("  Playback devices (skipping card 0):");
+    for dev in &playback_devices {
+        println!("    card {}: {} [{}] device {} -> {}",
+            dev.card_num, dev.card_name, dev.description, dev.device_num, dev.plughw());
+    }
+
+    if capture_devices.is_empty() {
+        anyhow::bail!("No USB capture devices found (arecord -l showed nothing beyond card 0)");
+    }
+    if playback_devices.is_empty() {
+        anyhow::bail!("No USB playback devices found (aplay -l showed nothing beyond card 0)");
+    }
+
+    // Step 2: Test each capture device for ambient noise
+    println!("\nStep 2: Testing capture devices for ambient noise (1s each)...");
+
+    struct MicResult {
+        device: AlsaDevice,
+        ambient_rms: f64,
+        is_live: bool,
+    }
+
+    let mut mic_results: Vec<MicResult> = Vec::new();
+
+    for dev in &capture_devices {
+        let hw = dev.plughw();
+        print!("  Testing {} ... ", hw);
+
+        let result = Command::new("arecord")
+            .args(["-D", &hw, "-d", "1", "-f", "S16_LE", "-r", "44100", "-c", "1", "-t", "raw", "-q"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output();
+
+        match result {
+            Ok(output) if output.status.success() => {
+                let rms = rms_from_raw_bytes(&output.stdout);
+                let is_live = rms > 0.001;
+                println!("RMS={:.6} {}", rms, if is_live { "LIVE" } else { "silent" });
+                mic_results.push(MicResult {
+                    device: dev.clone(),
+                    ambient_rms: rms,
+                    is_live,
+                });
+            }
+            Ok(output) => {
+                println!("FAILED (exit code: {:?})", output.status.code());
+            }
+            Err(e) => {
+                println!("ERROR: {}", e);
+            }
+        }
+    }
+
+    let live_mics: Vec<&MicResult> = mic_results.iter().filter(|m| m.is_live).collect();
+    if live_mics.is_empty() {
+        // Fall back to all mics that at least responded, even if silent
+        println!("\n  No mics picked up ambient noise — will try all responsive mics for loopback test.");
+    }
+
+    // Use live mics preferentially, but fall back to all responsive mics
+    let test_mics: Vec<&MicResult> = if live_mics.is_empty() {
+        mic_results.iter().collect()
+    } else {
+        live_mics
+    };
+
+    if test_mics.is_empty() {
+        anyhow::bail!("No capture devices responded successfully");
+    }
+
+    // Step 3: Test each (speaker, mic) pair with a loopback tone
+    println!("\nStep 3: Testing speaker-mic pairs with 1 kHz loopback tone...");
+
+    let tone_bytes = generate_sine_tone_bytes(1000.0, 1.0, 44100);
+    let mut found_pair: Option<(&AlsaDevice, &AlsaDevice)> = None;
+
+    'outer: for mic in &test_mics {
+        for spk in &playback_devices {
+            let mic_hw = mic.device.plughw();
+            let spk_hw = spk.plughw();
+            print!("  Testing speaker={} mic={} ... ", spk_hw, mic_hw);
+
+            // Start recording (2 seconds) in background
+            let mut arecord = match Command::new("arecord")
+                .args(["-D", &mic_hw, "-d", "2", "-f", "S16_LE", "-r", "44100", "-c", "1", "-t", "raw", "-q"])
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(e) => {
+                    println!("arecord spawn failed: {}", e);
+                    continue;
+                }
+            };
+
+            // Wait for arecord to initialize
+            std::thread::sleep(std::time::Duration::from_millis(200));
+
+            // Play the tone
+            let mut aplay = match Command::new("aplay")
+                .args(["-D", &spk_hw, "-f", "S16_LE", "-r", "44100", "-c", "1", "-t", "raw", "-q"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(e) => {
+                    println!("aplay spawn failed: {}", e);
+                    let _ = arecord.kill();
+                    continue;
+                }
+            };
+
+            // Pipe tone data to aplay
+            if let Some(ref mut stdin) = aplay.stdin {
+                use std::io::Write;
+                let _ = stdin.write_all(&tone_bytes);
+            }
+            drop(aplay.stdin.take()); // Close stdin so aplay finishes
+            let _ = aplay.wait();
+
+            // Wait for arecord to finish
+            let rec_output = match arecord.wait_with_output() {
+                Ok(output) => output,
+                Err(e) => {
+                    println!("arecord wait failed: {}", e);
+                    continue;
+                }
+            };
+
+            let rec_rms = rms_from_raw_bytes(&rec_output.stdout);
+            let threshold = if mic.ambient_rms > 0.0 {
+                mic.ambient_rms * 5.0
+            } else {
+                0.005 // absolute threshold if ambient was zero
+            };
+
+            let is_loopback = rec_rms > threshold;
+            println!("RMS={:.6} (ambient={:.6}, threshold={:.6}) {}",
+                rec_rms, mic.ambient_rms, threshold,
+                if is_loopback { "LOOPBACK OK" } else { "no loopback" });
+
+            if is_loopback {
+                found_pair = Some((&spk, &mic.device));
+                break 'outer;
+            }
+        }
+    }
+
+    // Step 4: Write ~/.asoundrc
+    let (spk, mic) = match found_pair {
+        Some(pair) => pair,
+        None => {
+            // If no loopback detected, use the first playback + first responsive mic
+            println!("\n  No loopback detected — falling back to first playback + first capture device.");
+            (&playback_devices[0], &test_mics[0].device)
+        }
+    };
+
+    println!("\nStep 4: Writing ~/.asoundrc...");
+    println!("  Speaker: {} [{}]", spk.card_name, spk.description);
+    println!("  Mic:     {} [{}]", mic.card_name, mic.description);
+
+    let asoundrc_content = format!(
+        r#"pcm.!default {{
+    type asym
+    playback.pcm "plughw:{spk_name},0"
+    capture.pcm "plughw:{mic_name},0"
+}}
+ctl.!default {{
+    type hw
+    card {spk_name}
+}}
+"#,
+        spk_name = spk.card_name,
+        mic_name = mic.card_name,
+    );
+
+    let home = std::env::var("HOME").context("HOME environment variable not set")?;
+    let asoundrc_path = format!("{}/.asoundrc", home);
+
+    // Back up existing .asoundrc if present
+    if std::path::Path::new(&asoundrc_path).exists() {
+        let backup_path = format!("{}.bak", asoundrc_path);
+        std::fs::copy(&asoundrc_path, &backup_path)
+            .context("Failed to back up existing ~/.asoundrc")?;
+        println!("  Backed up existing ~/.asoundrc to ~/.asoundrc.bak");
+    }
+
+    std::fs::write(&asoundrc_path, &asoundrc_content)
+        .context("Failed to write ~/.asoundrc")?;
+
+    println!("  Written to {}", asoundrc_path);
+    println!("\n=== Detection complete ===");
+    println!("Test with: arecord -d 2 -f cd test.wav && aplay test.wav");
+
+    Ok(())
+}
+
 /// AudioEngine manages sending and receiving FSK-modulated audio.
 ///
 /// Tries cpal first (works on desktop). If cpal fails (common on Pi with
