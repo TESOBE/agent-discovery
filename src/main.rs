@@ -55,13 +55,33 @@ enum Commands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let config = Config::from_env()?;
+    eprintln!("[early] main() entered");
+
+    let cli = match Cli::try_parse() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[early] CLI parse failed: {}", e);
+            std::process::exit(1);
+        }
+    };
+    eprintln!("[early] CLI parsed OK");
+
+    let config = match Config::from_env() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("[early] Config::from_env() failed: {}", e);
+            std::process::exit(1);
+        }
+    };
+    eprintln!("[early] config loaded, agent_name={}", config.agent_name);
 
     // Set up logging: stderr + rolling log file in log_dir.
     // Log file is named after the agent, e.g. agent-alpha.log
     let log_dir = &config.log_dir;
-    std::fs::create_dir_all(log_dir)?;
+    if let Err(e) = std::fs::create_dir_all(log_dir) {
+        eprintln!("[early] failed to create log dir '{}': {}", log_dir, e);
+        std::process::exit(1);
+    }
 
     // Clear the previous log file so each run starts fresh
     let log_file_path = format!("{}/{}.log", log_dir, config.agent_name);

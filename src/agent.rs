@@ -136,12 +136,16 @@ impl AgentMoodTracker {
 /// Run the main agent loop.
 /// If `udp_only` is true, skip audio discovery and start UDP immediately.
 pub async fn run(config: Config, udp_only: bool) -> Result<()> {
+    eprintln!("[early] agent::run() entered");
+
     let agent_id = Uuid::new_v4();
     let agent_name = config.agent_name.clone();
 
     // Bind the TCP listener early so we know the actual port (may differ
     // from the configured port if that one is already in use).
+    eprintln!("[early] binding TCP listener on port {}...", config.agent_listen_port);
     let tcp_listener = TcpCommListener::bind_with_fallback(config.agent_listen_port, 10)?;
+    eprintln!("[early] TCP listener bound OK");
     let actual_port = tcp_listener.local_addr()?.port();
     let agent_address = format!("127.0.0.1:{}", actual_port);
 
@@ -166,6 +170,7 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
     }
 
     // Try to set up MCP client
+    eprintln!("[early] setting up MCP client...");
     let (mcp_client, mcp_diagnosis) = match McpClient::new(&config).await {
         Ok(client) => {
             tracing::info!("MCP client connected, {} tools available", client.tools().len());
@@ -183,6 +188,7 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
     };
 
     // Set up OBP client for direct HTTP calls (entity record creation)
+    eprintln!("[early] setting up OBP client...");
     let obp_client = {
         let mut client = ObpClient::new(&config);
         match client.authenticate().await {
@@ -235,12 +241,14 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
     // Auto-detect USB audio devices and write ~/.asoundrc before opening audio.
     // This ensures card names (not numbers) are used, so re-plugging USB
     // devices into different ports doesn't break audio.
+    eprintln!("[early] detecting audio devices...");
     match crate::audio::device::detect_audio() {
         Ok(()) => tracing::info!("Audio device detection completed"),
         Err(e) => tracing::warn!("Audio device detection failed: {}. Using existing ~/.asoundrc.", e),
     }
 
     // Set up audio engine
+    eprintln!("[early] initializing audio engine...");
     let audio_engine = match AudioEngine::new() {
         Ok(engine) => {
             tracing::info!("Audio engine initialized");
