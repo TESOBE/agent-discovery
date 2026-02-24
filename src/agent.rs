@@ -1865,22 +1865,33 @@ async fn run_obp_connectivity_monitor(
     obp_api_base_url: String,
     audio_engine: Option<Arc<AudioEngine>>,
 ) {
-    const CHECK_INTERVAL_SECS: u64 = 120; // 2 minutes
+    const CHECK_INTERVAL_SECS: u64 = 16;
+
+    tracing::info!(
+        "OBP connectivity monitor started (checking every {}s, audio_engine={})",
+        CHECK_INTERVAL_SECS,
+        if audio_engine.is_some() { "available" } else { "NONE" }
+    );
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(CHECK_INTERVAL_SECS)).await;
 
+        tracing::info!("OBP connectivity check: testing {}...", obp_api_base_url);
         match check_obp_reachable(&obp_api_base_url).await {
             Ok(()) => {
-                tracing::debug!("OBP connectivity check: reachable");
+                tracing::info!("OBP connectivity check: reachable");
             }
             Err(e) => {
                 tracing::warn!("OBP unreachable: {}", e);
                 if let Some(ref engine) = audio_engine {
+                    tracing::info!("Queuing OBP alert tone via audio engine...");
                     let tone = crate::audio::device::generate_no_obp_tone();
-                    if let Err(tone_err) = engine.send_samples(tone) {
-                        tracing::warn!("Failed to play OBP alert tone: {}", tone_err);
+                    match engine.send_samples(tone) {
+                        Ok(()) => tracing::info!("OBP alert tone queued OK"),
+                        Err(tone_err) => tracing::warn!("Failed to play OBP alert tone: {}", tone_err),
                     }
+                } else {
+                    tracing::warn!("No audio engine available — cannot play OBP alert tone");
                 }
             }
         }
