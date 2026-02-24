@@ -413,6 +413,26 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
         }.instrument(agent_span.clone()));
     }
 
+    // Signal-channel-based peer discovery (cloud fallback alongside UDP)
+    if let Some(ref obp) = obp_client {
+        let obp = obp.clone();
+        let mgr = discovery_manager.clone();
+        let hs = handshake_done.clone();
+        tokio::spawn(
+            run_signal_discovery_loop(
+                obp,
+                mgr,
+                agent_id,
+                agent_name.clone(),
+                agent_address.clone(),
+                capabilities,
+                config.obp_api_base_url.clone(),
+                hs,
+            )
+            .instrument(agent_span.clone()),
+        );
+    }
+
     // Poll "task-requests" signal channel for work
     if let Some(ref obp) = obp_client {
         let obp = obp.clone();
@@ -1811,6 +1831,130 @@ async fn read_signal_messages_via_http(
         msg_count, response
     );
     Ok(response)
+}
+
+/// Cloud-based peer discovery via OBP signal channels.
+///
+/// Runs alongside UDP discovery (after the same 10 min delay). Agents
+/// advertise their presence on an `"agent-presence"` signal channel and poll
+/// it for other agents' ads, feeding discovered peers into the existing
+/// `DiscoveryManager::handle_message()` pipeline.
+async fn run_signal_discovery_loop(
+    obp: Arc<ObpClient>,
+    manager: Arc<tokio::sync::Mutex<DiscoveryManager>>,
+    agent_id: Uuid,
+    agent_name: String,
+    agent_address: String,
+    capabilities: Capabilities,
+    obp_api_base_url: String,
+    handshake_done: Arc<AtomicBool>,
+) {
+    use crate::protocol::message::DiscoveryMessage;
+
+    // Start signal discovery after a short delay (1 min) — much sooner than
+    // UDP (10 min) since it doesn't interfere with audio discovery.
+    const SIGNAL_DELAY_SECS: u64 = 5;
+    tracing::info!(
+        "Signal discovery: waiting {}s before starting...",
+        SIGNAL_DELAY_SECS
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(SIGNAL_DELAY_SECS)).await;
+
+    tracing::info!("Signal discovery: starting cloud-based peer discovery via OBP signal channels");
+
+    const CHANNEL: &str = "agent-presence";
+    const ACTIVE_INTERVAL_SECS: u64 = 30;
+    const SLOW_INTERVAL_SECS: u64 = 300; // 5 minutes after handshake
+
+    loop {
+        // --- Publish own presence ---
+        let payload = serde_json::json!({
+            "payload": {
+                "from": agent_name,
+                "agent_id": agent_id.to_string(),
+                "address": agent_address,
+                "capabilities": capabilities.0 as u32,
+                "obp_api_base_url": obp_api_base_url,
+                "type": "agent-presence",
+                "timestamp": crate::obp::entities::iso_now(),
+            }
+        });
+
+        match publish_signal_message_via_http(&obp, CHANNEL, &payload).await {
+            Ok(_) => {
+                tracing::info!("Signal discovery: published presence for '{}'", agent_name);
+            }
+            Err(e) => {
+                tracing::warn!("Signal discovery: failed to publish presence: {}", e);
+            }
+        }
+
+        // --- Read other agents' presence messages ---
+        match read_signal_messages_via_http(&obp, CHANNEL).await {
+            Ok(response) => {
+                if let Some(messages) = response.get("messages").and_then(|m| m.as_array()) {
+                    for msg in messages {
+                        let payload = match msg.get("payload") {
+                            Some(p) => p,
+                            None => continue,
+                        };
+
+                        // Only process agent-presence messages
+                        let msg_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                        if msg_type != "agent-presence" {
+                            continue;
+                        }
+
+                        // Skip our own messages
+                        let peer_id_str = payload.get("agent_id").and_then(|v| v.as_str()).unwrap_or("");
+                        let peer_id = match Uuid::parse_str(peer_id_str) {
+                            Ok(id) => id,
+                            Err(_) => continue,
+                        };
+                        if peer_id == agent_id {
+                            continue;
+                        }
+
+                        let peer_address = payload.get("address").and_then(|v| v.as_str()).unwrap_or("");
+                        let peer_caps_raw = payload.get("capabilities").and_then(|v| v.as_u64()).unwrap_or(0) as u8;
+                        let peer_caps = Capabilities(peer_caps_raw);
+                        let peer_obp_url = payload.get("obp_api_base_url").and_then(|v| v.as_str()).unwrap_or("");
+                        let peer_name = payload.get("from").and_then(|v| v.as_str()).unwrap_or("unknown");
+
+                        if peer_address.is_empty() {
+                            continue;
+                        }
+
+                        let discovery_msg = DiscoveryMessage::announce(
+                            peer_id,
+                            peer_address,
+                            peer_caps,
+                            peer_obp_url,
+                        );
+
+                        let mut mgr = manager.lock().await;
+                        if mgr.handle_message(&discovery_msg) {
+                            tracing::info!(
+                                "Signal discovery: found peer '{}' ({}@{})",
+                                peer_name, peer_id, peer_address
+                            );
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Signal discovery: failed to read presence channel: {}", e);
+            }
+        }
+
+        // After handshake, slow poll to every 5 minutes
+        let interval = if handshake_done.load(Ordering::Acquire) {
+            SLOW_INTERVAL_SECS
+        } else {
+            ACTIVE_INTERVAL_SECS
+        };
+        tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+    }
 }
 
 /// Poll the "task-requests" signal channel for work items posted by external
