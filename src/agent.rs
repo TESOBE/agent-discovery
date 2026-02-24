@@ -353,8 +353,9 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
     let config_clone = config.clone();
     let mcp_for_accept = mcp_client.clone();
     let obp_for_accept = obp_client.clone();
+    let engine_for_accept = audio_engine.clone();
     tokio::spawn(
-        run_tcp_accept_loop(tcp_listener, config_clone, mcp_for_accept, obp_for_accept)
+        run_tcp_accept_loop(tcp_listener, config_clone, mcp_for_accept, obp_for_accept, engine_for_accept)
             .instrument(agent_span.clone()),
     );
 
@@ -423,8 +424,9 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
 
     // OBP connectivity monitor — plays alert tone when OBP is unreachable
     if !config.obp_api_base_url.is_empty() {
+        let engine_for_monitor = audio_engine.clone();
         tokio::spawn(
-            run_obp_connectivity_monitor(config.obp_api_base_url.clone())
+            run_obp_connectivity_monitor(config.obp_api_base_url.clone(), engine_for_monitor)
                 .instrument(agent_span.clone()),
         );
     }
@@ -495,6 +497,7 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
                         &handshake_done,
                         &mood,
                         &discovery_manager,
+                        &audio_engine,
                     )
                     .await;
                 }
@@ -543,6 +546,7 @@ async fn handle_new_peer(
     handshake_done: &Arc<AtomicBool>,
     mood: &AgentMoodTracker,
     discovery_manager: &Arc<tokio::sync::Mutex<DiscoveryManager>>,
+    audio_engine: &Option<Arc<AudioEngine>>,
 ) {
     // Don't re-negotiate with peers we already handshook
     if negotiated_peers.contains(&peer.agent_id) {
@@ -582,7 +586,7 @@ async fn handle_new_peer(
                         establish_tcp_channel(
                             agent_id, agent_name, peer,
                             mcp_client, obp_client, mcp_diagnosis,
-                            mood, discovery_manager,
+                            mood, discovery_manager, audio_engine,
                         ).await;
                     }
                     "obp" => {
@@ -593,7 +597,7 @@ async fn handle_new_peer(
                         establish_tcp_channel(
                             agent_id, agent_name, peer,
                             mcp_client, obp_client, mcp_diagnosis,
-                            mood, discovery_manager,
+                            mood, discovery_manager, audio_engine,
                         ).await;
                     }
                     other => {
@@ -614,7 +618,7 @@ async fn handle_new_peer(
         establish_tcp_channel(
             agent_id, agent_name, peer,
             mcp_client, obp_client, mcp_diagnosis,
-            mood, discovery_manager,
+            mood, discovery_manager, audio_engine,
         ).await;
         negotiated_peers.insert(peer.agent_id);
         handshake_done.store(true, Ordering::Release);
@@ -637,6 +641,7 @@ async fn establish_tcp_channel(
     mcp_diagnosis: &Option<Vec<String>>,
     mood: &AgentMoodTracker,
     discovery_manager: &Arc<tokio::sync::Mutex<DiscoveryManager>>,
+    audio_engine: &Option<Arc<AudioEngine>>,
 ) {
     let peer_address = peer.address.clone();
     let greeting = serde_json::json!({
@@ -680,8 +685,11 @@ async fn establish_tcp_channel(
     {
         Ok(Ok((channel, _response))) => {
             tracing::info!("TCP handshake complete with peer");
-            if let Err(e) = crate::audio::device::play_handshake_chime() {
-                tracing::debug!("Could not play chime: {}", e);
+            if let Some(ref engine) = audio_engine {
+                let chime = crate::audio::device::generate_handshake_chime();
+                if let Err(e) = engine.send_samples(chime) {
+                    tracing::debug!("Could not play chime: {}", e);
+                }
             }
             channel
         }
@@ -1853,7 +1861,10 @@ async fn read_signal_messages_via_http(
 ///
 /// Periodically checks OBP reachability and plays a descending alert tone
 /// when the API is unreachable. Silent when healthy.
-async fn run_obp_connectivity_monitor(obp_api_base_url: String) {
+async fn run_obp_connectivity_monitor(
+    obp_api_base_url: String,
+    audio_engine: Option<Arc<AudioEngine>>,
+) {
     const CHECK_INTERVAL_SECS: u64 = 120; // 2 minutes
 
     loop {
@@ -1864,9 +1875,12 @@ async fn run_obp_connectivity_monitor(obp_api_base_url: String) {
                 tracing::debug!("OBP connectivity check: reachable");
             }
             Err(e) => {
-                tracing::warn!("OBP unreachable: {}. Playing alert tone.", e);
-                if let Err(tone_err) = crate::audio::device::play_no_obp_tone() {
-                    tracing::debug!("Failed to play OBP alert tone: {}", tone_err);
+                tracing::warn!("OBP unreachable: {}", e);
+                if let Some(ref engine) = audio_engine {
+                    let tone = crate::audio::device::generate_no_obp_tone();
+                    if let Err(tone_err) = engine.send_samples(tone) {
+                        tracing::warn!("Failed to play OBP alert tone: {}", tone_err);
+                    }
                 }
             }
         }
@@ -2770,6 +2784,7 @@ async fn run_tcp_accept_loop(
     config: Config,
     mcp_client: Option<Arc<tokio::sync::Mutex<McpClient>>>,
     obp_client: Option<Arc<ObpClient>>,
+    audio_engine: Option<Arc<AudioEngine>>,
 ) {
     let listener = Arc::new(listener);
     let config = Arc::new(config);
@@ -2778,12 +2793,13 @@ async fn run_tcp_accept_loop(
         let listener = listener.clone();
         let config = config.clone();
         let obp = obp_client.clone();
+        let engine = audio_engine.clone();
         match tokio::task::spawn_blocking(move || listener.accept()).await {
             Ok(Ok(channel)) => {
                 tracing::info!("Accepted TCP connection: {}", channel.description());
                 let span = tracing::Span::current();
                 tokio::spawn(async move {
-                    handle_tcp_connection(channel, &config, &obp).await;
+                    handle_tcp_connection(channel, &config, &obp, &engine).await;
                 }.instrument(span));
             }
             Ok(Err(e)) => {
@@ -2803,6 +2819,7 @@ async fn handle_tcp_connection(
     channel: TcpChannel,
     config: &Config,
     obp_client: &Option<Arc<ObpClient>>,
+    audio_engine: &Option<Arc<AudioEngine>>,
 ) {
     let desc = channel.description();
     tracing::info!("Handling TCP connection: {}", desc);
@@ -2847,8 +2864,11 @@ async fn handle_tcp_connection(
                     );
 
                     // Celebratory chime
-                    if let Err(e) = crate::audio::device::play_handshake_chime() {
-                        tracing::debug!("Could not play chime: {}", e);
+                    if let Some(ref engine) = audio_engine {
+                        let chime = crate::audio::device::generate_handshake_chime();
+                        if let Err(e) = engine.send_samples(chime) {
+                            tracing::debug!("Could not play chime: {}", e);
+                        }
                     }
 
                     // After hello/hello_ack, run the exploration protocol as responder
