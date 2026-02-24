@@ -832,6 +832,46 @@ enum AudioBackend {
 /// Matches modulator::SAMPLE_RATE so no resampling is needed.
 const SUBPROCESS_RATE: u32 = 44100;
 
+/// Maximum consecutive subprocess restart failures before giving up.
+const MAX_SUBPROCESS_RESTARTS: u32 = 5;
+
+/// Spawn an aplay subprocess that reads raw S16_LE mono from stdin.
+fn spawn_aplay() -> Result<std::process::Child> {
+    use std::process::{Command, Stdio};
+    let rate_str = SUBPROCESS_RATE.to_string();
+    Command::new("aplay")
+        .args(["-D", "default", "-f", "S16_LE", "-r", &rate_str, "-c", "1", "-t", "raw", "-q"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("Failed to spawn aplay — is alsa-utils installed?")
+}
+
+/// Spawn an arecord subprocess that writes raw S16_LE mono to stdout.
+fn spawn_arecord() -> Result<std::process::Child> {
+    use std::process::{Command, Stdio};
+    let rate_str = SUBPROCESS_RATE.to_string();
+    Command::new("arecord")
+        .args(["-D", "default", "-f", "S16_LE", "-r", &rate_str, "-c", "1", "-t", "raw", "-q"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("Failed to spawn arecord — is alsa-utils installed?")
+}
+
+/// Convert f32 samples to raw S16_LE bytes for aplay.
+fn samples_to_s16_bytes(samples: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(samples.len() * 2);
+    for sample in samples {
+        let clamped = sample.clamp(-1.0, 1.0);
+        let i16_val = (clamped * i16::MAX as f32) as i16;
+        bytes.extend_from_slice(&i16_val.to_le_bytes());
+    }
+    bytes
+}
+
 impl AudioEngine {
     /// Create a new AudioEngine.
     ///
@@ -962,62 +1002,106 @@ impl AudioEngine {
     /// ALSA read/write mode (not MMAP) and respect ~/.asoundrc.
     fn try_subprocess() -> Result<Self> {
         use std::io::{Read as IoRead, Write as IoWrite};
-        use std::process::{Command, Stdio};
 
-        let rate_str = SUBPROCESS_RATE.to_string();
-
-        // Spawn aplay: reads raw S16_LE mono from stdin
-        let mut output_child = Command::new("aplay")
-            .args(["-D", "default", "-f", "S16_LE", "-r", &rate_str, "-c", "1", "-t", "raw", "-q"])
-            .stdin(Stdio::piped())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("Failed to spawn aplay — is alsa-utils installed?")?;
-
-        // Spawn arecord: writes raw S16_LE mono to stdout
-        let mut input_child = Command::new("arecord")
-            .args(["-D", "default", "-f", "S16_LE", "-r", &rate_str, "-c", "1", "-t", "raw", "-q"])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .context("Failed to spawn arecord — is alsa-utils installed?")?;
+        let mut output_child = spawn_aplay()?;
+        let mut input_child = spawn_arecord()?;
 
         tracing::info!("Subprocess backend: aplay/arecord at {}Hz mono S16_LE", SUBPROCESS_RATE);
 
         let (tx_sender, tx_receiver): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = bounded(64);
         let (rx_sender, rx_receiver): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = bounded(1024);
 
-        // Output thread: receive f32 samples, convert to i16, write to aplay stdin
+        // Output thread: receive f32 samples, convert to i16, write to aplay stdin.
+        // Auto-restarts aplay if the subprocess dies (USB audio glitch, device reset, etc.)
         let mut aplay_stdin = output_child.stdin.take().context("No aplay stdin")?;
         let output_thread = std::thread::Builder::new()
             .name("aplay-writer".into())
             .spawn(move || {
+                let mut consecutive_failures: u32 = 0;
                 while let Ok(samples) = tx_receiver.recv() {
-                    let mut bytes = Vec::with_capacity(samples.len() * 2);
-                    for sample in &samples {
-                        let clamped = sample.clamp(-1.0, 1.0);
-                        let i16_val = (clamped * i16::MAX as f32) as i16;
-                        bytes.extend_from_slice(&i16_val.to_le_bytes());
+                    let bytes = samples_to_s16_bytes(&samples);
+                    if aplay_stdin.write_all(&bytes).is_ok() {
+                        consecutive_failures = 0;
+                        continue;
                     }
-                    if aplay_stdin.write_all(&bytes).is_err() {
+                    // aplay died — attempt restart
+                    consecutive_failures += 1;
+                    tracing::warn!(
+                        "aplay subprocess died (failure {}/{}), attempting restart...",
+                        consecutive_failures, MAX_SUBPROCESS_RESTARTS
+                    );
+                    if consecutive_failures >= MAX_SUBPROCESS_RESTARTS {
+                        tracing::error!("aplay: max restart attempts reached, giving up");
                         break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    match spawn_aplay() {
+                        Ok(mut child) => match child.stdin.take() {
+                            Some(new_stdin) => {
+                                aplay_stdin = new_stdin;
+                                tracing::info!("aplay restarted successfully");
+                                // Retry the write with the new process
+                                if aplay_stdin.write_all(&bytes).is_err() {
+                                    tracing::error!("Write failed immediately after aplay restart");
+                                    // Don't break; let the next recv() iteration detect the failure
+                                }
+                            }
+                            None => {
+                                tracing::error!("Restarted aplay had no stdin, giving up");
+                                break;
+                            }
+                        },
+                        Err(e) => {
+                            tracing::error!("Failed to restart aplay: {}, giving up", e);
+                            break;
+                        }
                     }
                 }
             })
             .context("Failed to spawn aplay writer thread")?;
 
-        // Input thread: read i16 from arecord stdout, convert to f32, send
+        // Input thread: read i16 from arecord stdout, convert to f32, send.
+        // Auto-restarts arecord if the subprocess dies.
         let mut arecord_stdout = input_child.stdout.take().context("No arecord stdout")?;
         let input_thread = std::thread::Builder::new()
             .name("arecord-reader".into())
             .spawn(move || {
                 let mut buf = [0u8; 2048]; // 1024 i16 samples
+                let mut consecutive_failures: u32 = 0;
                 loop {
                     match arecord_stdout.read(&mut buf) {
-                        Ok(0) => break,
+                        Ok(0) | Err(_) => {
+                            // arecord died — attempt restart
+                            consecutive_failures += 1;
+                            tracing::warn!(
+                                "arecord subprocess died (failure {}/{}), attempting restart...",
+                                consecutive_failures, MAX_SUBPROCESS_RESTARTS
+                            );
+                            if consecutive_failures >= MAX_SUBPROCESS_RESTARTS {
+                                tracing::error!("arecord: max restart attempts reached, giving up");
+                                break;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            match spawn_arecord() {
+                                Ok(mut child) => match child.stdout.take() {
+                                    Some(new_stdout) => {
+                                        arecord_stdout = new_stdout;
+                                        tracing::info!("arecord restarted successfully");
+                                        continue;
+                                    }
+                                    None => {
+                                        tracing::error!("Restarted arecord had no stdout, giving up");
+                                        break;
+                                    }
+                                },
+                                Err(e) => {
+                                    tracing::error!("Failed to restart arecord: {}, giving up", e);
+                                    break;
+                                }
+                            }
+                        }
                         Ok(n) => {
+                            consecutive_failures = 0;
                             let samples: Vec<f32> = buf[..n]
                                 .chunks_exact(2)
                                 .map(|pair| {
@@ -1029,7 +1113,6 @@ impl AudioEngine {
                                 // Channel full, drop oldest
                             }
                         }
-                        Err(_) => break,
                     }
                 }
             })
