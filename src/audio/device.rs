@@ -836,29 +836,95 @@ const SUBPROCESS_RATE: u32 = 44100;
 const MAX_SUBPROCESS_RESTARTS: u32 = 5;
 
 /// Spawn an aplay subprocess that reads raw S16_LE mono from stdin.
+/// Stderr is captured and logged so we can see ALSA errors when aplay dies.
 fn spawn_aplay() -> Result<std::process::Child> {
     use std::process::{Command, Stdio};
     let rate_str = SUBPROCESS_RATE.to_string();
-    Command::new("aplay")
-        .args(["-D", "default", "-f", "S16_LE", "-r", &rate_str, "-c", "1", "-t", "raw", "-q"])
+    let mut child = Command::new("aplay")
+        .args(["-D", "default", "-f", "S16_LE", "-r", &rate_str, "-c", "1", "-t", "raw"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .context("Failed to spawn aplay — is alsa-utils installed?")
+        .context("Failed to spawn aplay — is alsa-utils installed?")?;
+
+    // Drain stderr in a background thread so ALSA errors get logged
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::Builder::new()
+            .name("aplay-stderr".into())
+            .spawn(move || {
+                use std::io::{BufRead, BufReader};
+                let reader = BufReader::new(stderr);
+                for line in reader.lines() {
+                    match line {
+                        Ok(l) if !l.is_empty() => tracing::warn!("aplay stderr: {}", l),
+                        _ => break,
+                    }
+                }
+            })
+            .ok();
+    }
+
+    // Check it didn't die immediately
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            anyhow::bail!("aplay exited immediately with {}", status);
+        }
+        Ok(None) => {} // still running — good
+        Err(e) => {
+            anyhow::bail!("Failed to check aplay status: {}", e);
+        }
+    }
+
+    tracing::info!("aplay spawned (pid {})", child.id());
+    Ok(child)
 }
 
 /// Spawn an arecord subprocess that writes raw S16_LE mono to stdout.
+/// Stderr is captured and logged so we can see ALSA errors when arecord dies.
 fn spawn_arecord() -> Result<std::process::Child> {
     use std::process::{Command, Stdio};
     let rate_str = SUBPROCESS_RATE.to_string();
-    Command::new("arecord")
-        .args(["-D", "default", "-f", "S16_LE", "-r", &rate_str, "-c", "1", "-t", "raw", "-q"])
+    let mut child = Command::new("arecord")
+        .args(["-D", "default", "-f", "S16_LE", "-r", &rate_str, "-c", "1", "-t", "raw"])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .context("Failed to spawn arecord — is alsa-utils installed?")
+        .context("Failed to spawn arecord — is alsa-utils installed?")?;
+
+    // Drain stderr in a background thread so ALSA errors get logged
+    if let Some(stderr) = child.stderr.take() {
+        std::thread::Builder::new()
+            .name("arecord-stderr".into())
+            .spawn(move || {
+                use std::io::{BufRead, BufReader};
+                let reader = BufReader::new(stderr);
+                for line in reader.lines() {
+                    match line {
+                        Ok(l) if !l.is_empty() => tracing::warn!("arecord stderr: {}", l),
+                        _ => break,
+                    }
+                }
+            })
+            .ok();
+    }
+
+    // Check it didn't die immediately
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    match child.try_wait() {
+        Ok(Some(status)) => {
+            anyhow::bail!("arecord exited immediately with {}", status);
+        }
+        Ok(None) => {} // still running — good
+        Err(e) => {
+            anyhow::bail!("Failed to check arecord status: {}", e);
+        }
+    }
+
+    tracing::info!("arecord spawned (pid {})", child.id());
+    Ok(child)
 }
 
 /// Convert f32 samples to raw S16_LE bytes for aplay.
@@ -1008,6 +1074,28 @@ impl AudioEngine {
 
         tracing::info!("Subprocess backend: aplay/arecord at {}Hz mono S16_LE", SUBPROCESS_RATE);
 
+        // Probe: write a short silence to aplay to verify it actually accepts data.
+        // If the device is misconfigured or busy, this catches it at init time
+        // rather than failing silently later.
+        {
+            let silence = vec![0u8; 256]; // 128 zero samples
+            let stdin = output_child.stdin.as_mut().context("No aplay stdin for probe")?;
+            stdin.write_all(&silence).context("aplay probe write failed — device may be misconfigured")?;
+            // Give aplay a moment to process and check it's still alive
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            match output_child.try_wait() {
+                Ok(Some(status)) => {
+                    anyhow::bail!("aplay died during probe write with {}", status);
+                }
+                Ok(None) => {
+                    tracing::info!("aplay probe write OK — subprocess is accepting audio data");
+                }
+                Err(e) => {
+                    anyhow::bail!("Failed to check aplay after probe: {}", e);
+                }
+            }
+        }
+
         let (tx_sender, tx_receiver): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = bounded(64);
         let (rx_sender, rx_receiver): (Sender<Vec<f32>>, Receiver<Vec<f32>>) = bounded(1024);
 
@@ -1018,11 +1106,21 @@ impl AudioEngine {
             .name("aplay-writer".into())
             .spawn(move || {
                 let mut consecutive_failures: u32 = 0;
+                let mut total_writes: u64 = 0;
                 while let Ok(samples) = tx_receiver.recv() {
                     let bytes = samples_to_s16_bytes(&samples);
-                    if aplay_stdin.write_all(&bytes).is_ok() {
-                        consecutive_failures = 0;
-                        continue;
+                    match aplay_stdin.write_all(&bytes) {
+                        Ok(()) => {
+                            total_writes += 1;
+                            consecutive_failures = 0;
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "aplay write_all failed after {} successful writes: {} (kind={:?})",
+                                total_writes, e, e.kind()
+                            );
+                        }
                     }
                     // aplay died — attempt restart
                     consecutive_failures += 1;
@@ -1070,41 +1168,25 @@ impl AudioEngine {
             .spawn(move || {
                 let mut buf = [0u8; 2048]; // 1024 i16 samples
                 let mut consecutive_failures: u32 = 0;
+                let mut total_reads: u64 = 0;
                 loop {
                     match arecord_stdout.read(&mut buf) {
-                        Ok(0) | Err(_) => {
-                            // arecord died — attempt restart
-                            consecutive_failures += 1;
-                            tracing::warn!(
-                                "arecord subprocess died (failure {}/{}), attempting restart...",
-                                consecutive_failures, MAX_SUBPROCESS_RESTARTS
+                        Ok(0) => {
+                            tracing::error!(
+                                "arecord read returned EOF after {} successful reads",
+                                total_reads
                             );
-                            if consecutive_failures >= MAX_SUBPROCESS_RESTARTS {
-                                tracing::error!("arecord: max restart attempts reached, giving up");
-                                break;
-                            }
-                            std::thread::sleep(std::time::Duration::from_millis(500));
-                            match spawn_arecord() {
-                                Ok(mut child) => match child.stdout.take() {
-                                    Some(new_stdout) => {
-                                        arecord_stdout = new_stdout;
-                                        tracing::info!("arecord restarted successfully");
-                                        continue;
-                                    }
-                                    None => {
-                                        tracing::error!("Restarted arecord had no stdout, will retry");
-                                        // Don't break; old dead stdout will return Ok(0)/Err
-                                        // on next read, triggering another restart attempt
-                                    }
-                                },
-                                Err(e) => {
-                                    tracing::error!("Failed to restart arecord: {}, will retry", e);
-                                    // Don't break; old dead stdout will return Ok(0)/Err
-                                    // on next read, triggering another restart attempt
-                                }
-                            }
+                            // fall through to restart
+                        }
+                        Err(e) => {
+                            tracing::error!(
+                                "arecord read failed after {} successful reads: {} (kind={:?})",
+                                total_reads, e, e.kind()
+                            );
+                            // fall through to restart
                         }
                         Ok(n) => {
+                            total_reads += 1;
                             consecutive_failures = 0;
                             let samples: Vec<f32> = buf[..n]
                                 .chunks_exact(2)
@@ -1116,6 +1198,32 @@ impl AudioEngine {
                             if rx_sender.try_send(samples).is_err() {
                                 // Channel full, drop oldest
                             }
+                            continue;
+                        }
+                    }
+                    // arecord died — attempt restart
+                    consecutive_failures += 1;
+                    tracing::warn!(
+                        "arecord subprocess died (failure {}/{}), attempting restart...",
+                        consecutive_failures, MAX_SUBPROCESS_RESTARTS
+                    );
+                    if consecutive_failures >= MAX_SUBPROCESS_RESTARTS {
+                        tracing::error!("arecord: max restart attempts reached, giving up");
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    match spawn_arecord() {
+                        Ok(mut child) => match child.stdout.take() {
+                            Some(new_stdout) => {
+                                arecord_stdout = new_stdout;
+                                tracing::info!("arecord restarted successfully");
+                            }
+                            None => {
+                                tracing::error!("Restarted arecord had no stdout, will retry");
+                            }
+                        },
+                        Err(e) => {
+                            tracing::error!("Failed to restart arecord: {}, will retry", e);
                         }
                     }
                 }
