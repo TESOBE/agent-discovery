@@ -1043,17 +1043,19 @@ impl AudioEngine {
                                 // Retry the write with the new process
                                 if aplay_stdin.write_all(&bytes).is_err() {
                                     tracing::error!("Write failed immediately after aplay restart");
-                                    // Don't break; let the next recv() iteration detect the failure
+                                    // Don't break; next recv() iteration will detect and retry
                                 }
                             }
                             None => {
-                                tracing::error!("Restarted aplay had no stdin, giving up");
-                                break;
+                                tracing::error!("Restarted aplay had no stdin, will retry");
+                                // Don't break; old dead stdin will fail on next write,
+                                // triggering another restart attempt
                             }
                         },
                         Err(e) => {
-                            tracing::error!("Failed to restart aplay: {}, giving up", e);
-                            break;
+                            tracing::error!("Failed to restart aplay: {}, will retry", e);
+                            // Don't break; old dead stdin will fail on next write,
+                            // triggering another restart attempt
                         }
                     }
                 }
@@ -1090,13 +1092,15 @@ impl AudioEngine {
                                         continue;
                                     }
                                     None => {
-                                        tracing::error!("Restarted arecord had no stdout, giving up");
-                                        break;
+                                        tracing::error!("Restarted arecord had no stdout, will retry");
+                                        // Don't break; old dead stdout will return Ok(0)/Err
+                                        // on next read, triggering another restart attempt
                                     }
                                 },
                                 Err(e) => {
-                                    tracing::error!("Failed to restart arecord: {}, giving up", e);
-                                    break;
+                                    tracing::error!("Failed to restart arecord: {}, will retry", e);
+                                    // Don't break; old dead stdout will return Ok(0)/Err
+                                    // on next read, triggering another restart attempt
                                 }
                             }
                         }
