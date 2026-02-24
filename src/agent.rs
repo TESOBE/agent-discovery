@@ -413,6 +413,14 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
         }.instrument(agent_span.clone()));
     }
 
+    // OBP connectivity monitor — plays alert tone when OBP is unreachable
+    if !config.obp_api_base_url.is_empty() {
+        tokio::spawn(
+            run_obp_connectivity_monitor(config.obp_api_base_url.clone())
+                .instrument(agent_span.clone()),
+        );
+    }
+
     // Signal-channel-based peer discovery (cloud fallback alongside UDP)
     if let Some(ref obp) = obp_client {
         let obp = obp.clone();
@@ -1835,6 +1843,28 @@ async fn read_signal_messages_via_http(
 
 /// Cloud-based peer discovery via OBP signal channels.
 ///
+/// Periodically checks OBP reachability and plays a descending alert tone
+/// when the API is unreachable. Silent when healthy.
+async fn run_obp_connectivity_monitor(obp_api_base_url: String) {
+    const CHECK_INTERVAL_SECS: u64 = 120; // 2 minutes
+
+    loop {
+        tokio::time::sleep(std::time::Duration::from_secs(CHECK_INTERVAL_SECS)).await;
+
+        match check_obp_reachable(&obp_api_base_url).await {
+            Ok(()) => {
+                tracing::debug!("OBP connectivity check: reachable");
+            }
+            Err(e) => {
+                tracing::warn!("OBP unreachable: {}. Playing alert tone.", e);
+                if let Err(tone_err) = crate::audio::device::play_no_obp_tone() {
+                    tracing::debug!("Failed to play OBP alert tone: {}", tone_err);
+                }
+            }
+        }
+    }
+}
+
 /// Runs alongside UDP discovery (after the same 10 min delay). Agents
 /// advertise their presence on an `"agent-presence"` signal channel and poll
 /// it for other agents' ads, feeding discovered peers into the existing
