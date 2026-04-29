@@ -52,6 +52,20 @@ enum Commands {
     TestRoundtrip,
     /// Post audio device diagnostics to OBP signal channel 'audio-diagnostics'
     DiagnoseAudio,
+    /// Drive the stream.service systemd unit directly — smoke-test the
+    /// agent's system_commands::stream handlers without going through OBP.
+    /// Targets `STREAM_SERVICE_NAME` (default: stream.service).
+    Stream {
+        #[arg(value_enum)]
+        action: StreamAction,
+    },
+}
+
+#[derive(Clone, clap::ValueEnum)]
+enum StreamAction {
+    Start,
+    Stop,
+    Status,
 }
 
 #[tokio::main]
@@ -132,6 +146,21 @@ async fn main() -> Result<()> {
         }
         Commands::DiagnoseAudio => {
             audio::device::diagnose_audio_to_signal(&config).await?;
+        }
+        Commands::Stream { action } => {
+            let service = &config.stream_service_name;
+            let result = match action {
+                StreamAction::Start => system_commands::stream::start(service).await,
+                StreamAction::Stop => system_commands::stream::stop(service).await,
+                StreamAction::Status => system_commands::stream::status(service).await,
+            };
+            match result {
+                Ok(v) => println!("{}", serde_json::to_string_pretty(&v)?),
+                Err(e) => {
+                    eprintln!("error: {}", e);
+                    std::process::exit(1);
+                }
+            }
         }
     }
 

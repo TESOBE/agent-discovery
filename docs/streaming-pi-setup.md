@@ -8,7 +8,7 @@ A Sony Cinema Line camera → ATEM Mini Pro → OBS on Linux laptop → Restream
 - Streaming happens only every 1-2 months, so the setup is always out of date by the time it's needed
 - Blackmagic (ATEM) Linux drivers break on kernel updates
 - OBS on Linux adds further fragility
-- Restream adds an extra hop between OBS and Twitch
+- Restream added an extra hop between OBS and Twitch (since dropped — see below)
 
 ---
 
@@ -27,7 +27,7 @@ Replace the laptop entirely as the streaming device with a **Raspberry Pi 5** ru
 
 ```
 Sony HDMI ──┐
-             ├→ ATEM Mini Pro → USB → Pi 5 → ffmpeg → Restream → Twitch
+             ├→ ATEM Mini Pro → USB → Pi 5 → ffmpeg → YouTube Live
 Mixer 3.5mm ┘
 ```
 
@@ -36,9 +36,13 @@ Mixer 3.5mm ┘
 - **Pi 5** ingests USB capture, encodes, and streams
 - **No OBS** — replaced by a single ffmpeg command
 - **No laptop** in the signal chain
+- **No Restream** — ffmpeg pushes directly to YouTube's RTMP ingest, removing one external service from the critical path
 
 ### Why Keep the ATEM?
 Although explored removing it, the ATEM earns its place by combining two sources (camera HDMI + mixer audio) into one USB feed to the Pi. Already owned, so no cost argument against it.
+
+### Why YouTube Direct (No Restream)?
+Restream was previously used as a fan-out hub. Streaming directly to YouTube's RTMP ingest removes a third-party hop, simplifies failure modes (one service to be up, not two), and avoids Restream's pricing tiers. The trade-off is no automatic fan-out to multiple platforms — fine for a single-destination workflow.
 
 ---
 
@@ -53,10 +57,12 @@ ffmpeg \
   -vcodec libx264 -preset veryfast -b:v 5500k -minrate 5500k -maxrate 5500k \
   -bufsize 11000k -g 60 -keyint_min 60 \
   -acodec aac -b:a 160k \
-  -f flv rtmp://live.restream.io/live/YOUR_KEY
+  -f flv rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY
 ```
 
-Runs as a **systemd service** — starts automatically on boot when ATEM is connected.
+YouTube's primary RTMP ingest is `rtmp://a.rtmp.youtube.com/live2`; the backup is `rtmp://b.rtmp.youtube.com/live2?backup=1`. The stream key lives in YouTube Studio under Live → Stream → Stream key (use a "default stream" / persistent key for repeatable testing).
+
+Runs as a **systemd service** (`stream.service`, installed via `install-stream-service.sh`). The unit reads `RTMP_URL` and `RTMP_STREAM_KEY` from `.stream-env` so the key isn't baked into the unit file. The agent's `system-commands` handler starts and stops the service on demand; it is not enabled at boot.
 
 ### OBS Settings (for reference, if OBS ever used)
 - Encoder: x264 or NVENC
@@ -144,19 +150,21 @@ Switching WiFi from a remote command is dangerous: a wrong SSID/PSK leaves the P
 
 ---
 
-## What Needs Building
+## Implementation Status
 
-**On the Pi:**
-- New Rust module `src/system_commands/` in the agent:
-  - `mod.rs` — `SystemCommand` enum, poller task, response publishing
-  - `wifi.rs` — `nmcli` wrappers, snapshot/attempt/probe/revert state machine
-  - `stream.rs` — `systemctl start|stop|status` wrappers for the ffmpeg unit
-  - `watchdog.rs` — reachability monitor + forced hotspot fallback
-- Wire the poller into `agent.rs` alongside the existing task-request poller
-- systemd unit for the ffmpeg streaming service
-- Pre-configured NetworkManager profile for the phone hotspot at priority 100
+**Done in this repo:**
+- `src/system_commands/` module — `mod.rs` (poller + dispatch), `wifi.rs` (nmcli confirm-or-revert), `stream.rs` (`systemctl` wrappers), `watchdog.rs` (reachability + forced hotspot fallback)
+- Wired into `agent.rs` alongside the existing task-request poller
+- `install-stream-service.sh` + `.stream-env.example` — generates `/etc/systemd/system/stream.service` from per-Pi env (RTMP_URL, RTMP_STREAM_KEY, V4L2_DEVICE, ALSA_DEVICE, BITRATE_KBPS, BUFSIZE_KBPS). The unit is intentionally NOT enabled at boot — the agent controls start/stop on demand
+- `cargo run -- stream <start|stop|status>` — CLI smoke-test for the systemctl wrappers without going through OBP
+
+**Per-Pi setup (manual):**
+- Install ffmpeg: `sudo apt install ffmpeg`
+- Fill in `.stream-env` from the example, with the YouTube RTMP URL and stream key
+- `sudo bash install-stream-service.sh` to write the unit
+- NetworkManager profile for the phone hotspot at `connection.autoconnect-priority 100` (so it auto-falls-back even if the agent's revert logic crashes mid-switch)
 
 **On OBP:**
-- Channel `system-commands` created (and `system-command-responses` for replies)
-- Pi agent registered with instructor user IDs authorised to post commands
+- Channel `system-commands` is auto-created on first publish (no setup needed)
+- The Pi agent's `INSTRUCTOR_USER_IDS` env var must include the OBP user IDs allowed to post commands
 - No new endpoint definitions — existing signal-channel APIs are sufficient

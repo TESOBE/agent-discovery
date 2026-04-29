@@ -221,7 +221,48 @@ cargo run -- list-devices          # Show audio devices
 cargo run -- test-tone -m "HI"    # Play an FSK-encoded tone
 cargo run -- decode -d 10          # Listen for FSK tones for 10 seconds
 cargo run -- test-roundtrip        # Play and decode via mic
+cargo run -- stream status         # Query the stream.service systemd unit
+cargo run -- stream start          # Start ffmpeg streaming (smoke-test)
+cargo run -- stream stop           # Stop ffmpeg streaming
 ```
+
+## Streaming
+
+The agent can drive an `ffmpeg` streaming pipeline as a side capability — see [docs/streaming-pi-setup.md](docs/streaming-pi-setup.md) for the full architecture and per-Pi setup instructions.
+
+### Test the RTMP pipeline standalone (no agent, no capture hardware)
+
+Useful for first-time validation on a desktop before moving to the Pi: ffmpeg generates a synthetic test pattern (colour bars + 1 kHz tone) and pushes it to your RTMP destination. If this lands on YouTube Studio, the streaming leg works — independent of the agent or capture hardware.
+
+```bash
+ffmpeg -re \
+  -f lavfi -i "testsrc2=size=1280x720:rate=30" \
+  -f lavfi -i "sine=frequency=1000:sample_rate=48000" \
+  -vcodec libx264 -preset veryfast \
+  -b:v 2500k -minrate 2500k -maxrate 2500k \
+  -bufsize 5000k -g 60 -keyint_min 60 \
+  -acodec aac -b:a 128k -ar 48000 \
+  -f flv "rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY"
+```
+
+- `-re` reads at native frame rate; without it ffmpeg blasts frames as fast as possible and the receiver throttles or drops.
+- `testsrc2` is the standard ffmpeg test pattern with timestamp + colour bars + frame counter, so you can confirm frames are flowing on the receiver.
+- `sine=frequency=1000` is a steady 1 kHz beep — confirms audio is intact.
+- 2500 kbps is a deliberately low test bitrate. Production uses 5500 kbps (see `.stream-env.example`).
+
+YouTube takes ~10–30s to show "live" in Studio after ffmpeg starts pushing. Use a "default stream" / persistent key under Live → Stream for repeatable testing.
+
+### Install the systemd unit on a Pi
+
+Once the standalone ffmpeg works, the next layer is the agent-controllable `stream.service` unit:
+
+```
+cp .stream-env.example .stream-env       # then $EDITOR .stream-env
+sudo apt install ffmpeg
+sudo bash install-stream-service.sh
+```
+
+The service is intentionally NOT enabled at boot — the agent's `system-commands` channel handler starts/stops it on demand (or you can drive it manually with `systemctl start stream.service`, or via the CLI smoke-test commands above).
 
 ## Tests
 
