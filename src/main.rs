@@ -10,6 +10,7 @@ mod mcp;
 mod negotiation;
 mod obp;
 mod protocol;
+mod system_commands;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};

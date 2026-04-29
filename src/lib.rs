@@ -9,3 +9,4 @@ pub mod mcp;
 pub mod negotiation;
 pub mod obp;
 pub mod protocol;
+pub mod system_commands;

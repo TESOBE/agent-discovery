@@ -17,6 +17,17 @@ pub struct Config {
     /// Comma-separated list of OBP user IDs allowed to instruct this agent.
     /// If empty, all task requests are rejected (closed by default).
     pub instructor_user_ids: Vec<String>,
+    /// NetworkManager connection profile name used as a guaranteed fallback
+    /// (typically the phone hotspot). Empty disables the watchdog.
+    pub hotspot_profile_name: String,
+    /// Consecutive watchdog probe failures before forcing the hotspot.
+    pub watchdog_fail_threshold: u32,
+    /// Seconds between watchdog reachability probes.
+    pub watchdog_probe_interval_secs: u64,
+    /// systemd unit name running the ffmpeg stream.
+    pub stream_service_name: String,
+    /// Seconds between `system-commands` channel polls.
+    pub system_command_poll_interval_secs: u64,
 }
 
 impl Config {
@@ -53,6 +64,21 @@ impl Config {
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())
                 .collect(),
+            hotspot_profile_name: std::env::var("HOTSPOT_PROFILE_NAME").unwrap_or_default(),
+            watchdog_fail_threshold: std::env::var("WATCHDOG_FAIL_THRESHOLD")
+                .unwrap_or_else(|_| "5".into())
+                .parse()
+                .context("WATCHDOG_FAIL_THRESHOLD must be a positive integer")?,
+            watchdog_probe_interval_secs: std::env::var("WATCHDOG_PROBE_INTERVAL_SECS")
+                .unwrap_or_else(|_| "60".into())
+                .parse()
+                .context("WATCHDOG_PROBE_INTERVAL_SECS must be a positive integer")?,
+            stream_service_name: std::env::var("STREAM_SERVICE_NAME")
+                .unwrap_or_else(|_| "stream.service".into()),
+            system_command_poll_interval_secs: std::env::var("SYSTEM_COMMAND_POLL_INTERVAL_SECS")
+                .unwrap_or_else(|_| "10".into())
+                .parse()
+                .context("SYSTEM_COMMAND_POLL_INTERVAL_SECS must be a positive integer")?,
         })
     }
 }

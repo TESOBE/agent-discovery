@@ -462,6 +462,30 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
         }.instrument(agent_span.clone()));
     }
 
+    // Poll "system-commands" signal channel for direct (non-Claude) ops
+    // like wifi-connect and stream-start. See docs/streaming-pi-setup.md.
+    if let Some(ref obp) = obp_client {
+        let obp = obp.clone();
+        let name = agent_name.clone();
+        let cfg = config.clone();
+        tokio::spawn(async move {
+            crate::system_commands::run_system_command_poller(obp, cfg, name).await;
+        }.instrument(agent_span.clone()));
+    }
+
+    // Reachability watchdog: force hotspot re-join after prolonged OBP loss
+    {
+        let base = config.obp_api_base_url.clone();
+        let hotspot = config.hotspot_profile_name.clone();
+        let threshold = config.watchdog_fail_threshold;
+        let interval = std::time::Duration::from_secs(config.watchdog_probe_interval_secs);
+        tokio::spawn(async move {
+            crate::system_commands::watchdog::run_reachability_watchdog(
+                base, hotspot, threshold, interval,
+            ).await;
+        }.instrument(agent_span.clone()));
+    }
+
     // Run the event loop inside the agent span
     let _guard = agent_span.enter();
 
