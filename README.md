@@ -189,7 +189,7 @@ To run the agent as a service that starts automatically on boot:
    ```
 
 This installs a systemd service that:
-- Derives a stable agent name from the first 12 hex characters of the SHA-256 hash of the Pi's MAC address (so each Pi gets a unique, deterministic identity)
+- Derives a stable agent name from the Pi's MAC address in the form `<adjective>-<verb>-<arch>-<hash6>` (e.g. `swift-running-pi5-a1b2c3`). Same MAC always yields the same name. Architecture is Pi-aware (`pi5`/`pi4`/…) with `uname -m` fallback (`x86`, `arm64`, …).
 - Loads your `.env` file for API keys and other config
 - Waits for the network to be up before starting
 - Adds the `audio` group so the agent can access mic/speaker
