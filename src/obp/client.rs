@@ -54,19 +54,19 @@ pub struct ObpClient {
 impl ObpClient {
     pub fn new(config: &Config) -> Self {
         Self {
-            base_url: config.obp_api_base_url.clone(),
+            base_url: config.obp_api_base_url_a.clone(),
             http_client: reqwest::Client::new(),
             auth_token: None,
-            username: config.obp_username.clone(),
-            password: config.obp_password.clone(),
-            consumer_key: config.obp_consumer_key.clone(),
+            username: config.obp_username_a.clone(),
+            password: config.obp_password_a.clone(),
+            consumer_key: config.obp_consumer_key_a.clone(),
         }
     }
 
     /// Authenticate via DirectLogin and store the token.
     pub async fn authenticate(&mut self) -> Result<()> {
         if self.username.is_empty() || self.password.is_empty() || self.consumer_key.is_empty() {
-            anyhow::bail!("OBP credentials not configured (OBP_USERNAME, OBP_PASSWORD, OBP_CONSUMER_KEY)");
+            anyhow::bail!("OBP credentials not configured (OBP_USERNAME_A, OBP_PASSWORD_A, OBP_CONSUMER_KEY_A)");
         }
 
         let auth_header = format!(

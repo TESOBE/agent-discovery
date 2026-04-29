@@ -165,7 +165,7 @@ async fn dispatch(cmd: SystemCommand, config: &Config) -> Result<Value> {
             ssid,
             password,
             priority,
-        } => wifi::connect(&ssid, &password, priority, &config.obp_api_base_url).await,
+        } => wifi::connect(&ssid, &password, priority, &config.obp_api_base_url_a).await,
         SystemCommand::WifiForget { ssid } => wifi::forget(&ssid).await,
         SystemCommand::StreamStart => stream::start(&config.stream_service_name).await,
         SystemCommand::StreamStop => stream::stop(&config.stream_service_name).await,

@@ -6,10 +6,17 @@ pub struct Config {
     pub agent_listen_port: u16,
     pub claude_api_key: String,
     pub claude_model: String,
-    pub obp_api_base_url: String,
-    pub obp_username: String,
-    pub obp_password: String,
-    pub obp_consumer_key: String,
+    /// Primary OBP instance (typically the local / self-hosted one).
+    pub obp_api_base_url_a: String,
+    pub obp_username_a: String,
+    pub obp_password_a: String,
+    pub obp_consumer_key_a: String,
+    /// Secondary OBP instance (typically apisandbox.openbankproject.com).
+    /// Loaded from env; not yet wired into runtime — federation comes later.
+    pub obp_api_base_url_b: String,
+    pub obp_username_b: String,
+    pub obp_password_b: String,
+    pub obp_consumer_key_b: String,
     /// URL of a running MCP server (streamable HTTP transport).
     pub obp_mcp_server_url: Option<String>,
     /// Directory for log files. Defaults to /tmp/agent-discovery.
@@ -50,10 +57,14 @@ impl Config {
                 .unwrap_or_default(),
             claude_model: std::env::var("CLAUDE_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-4-20250514".into()),
-            obp_api_base_url: std::env::var("OBP_API_BASE_URL").unwrap_or_default(),
-            obp_username: std::env::var("OBP_USERNAME").unwrap_or_default(),
-            obp_password: std::env::var("OBP_PASSWORD").unwrap_or_default(),
-            obp_consumer_key: std::env::var("OBP_CONSUMER_KEY").unwrap_or_default(),
+            obp_api_base_url_a: std::env::var("OBP_API_BASE_URL_A").unwrap_or_default(),
+            obp_username_a: std::env::var("OBP_USERNAME_A").unwrap_or_default(),
+            obp_password_a: std::env::var("OBP_PASSWORD_A").unwrap_or_default(),
+            obp_consumer_key_a: std::env::var("OBP_CONSUMER_KEY_A").unwrap_or_default(),
+            obp_api_base_url_b: std::env::var("OBP_API_BASE_URL_B").unwrap_or_default(),
+            obp_username_b: std::env::var("OBP_USERNAME_B").unwrap_or_default(),
+            obp_password_b: std::env::var("OBP_PASSWORD_B").unwrap_or_default(),
+            obp_consumer_key_b: std::env::var("OBP_CONSUMER_KEY_B").unwrap_or_default(),
             obp_mcp_server_url: Some(std::env::var("OBP_MCP_SERVER_URL")
                 .unwrap_or_else(|_| "http://0.0.0.0:9100/mcp".into())),
             log_dir: std::env::var("LOG_DIR")

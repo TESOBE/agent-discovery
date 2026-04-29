@@ -165,7 +165,7 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
     if !config.claude_api_key.is_empty() {
         capabilities = capabilities.with_claude();
     }
-    if !config.obp_username.is_empty() {
+    if !config.obp_username_a.is_empty() {
         capabilities = capabilities.with_obp();
     }
 
@@ -229,7 +229,7 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
         agent_address: agent_address.clone(),
         capabilities,
         tx_band,
-        obp_api_base_url: config.obp_api_base_url.clone(),
+        obp_api_base_url: config.obp_api_base_url_a.clone(),
         ..Default::default()
     };
 
@@ -423,10 +423,10 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
     }
 
     // OBP connectivity monitor — plays alert tone when OBP is unreachable
-    if !config.obp_api_base_url.is_empty() {
+    if !config.obp_api_base_url_a.is_empty() {
         let engine_for_monitor = audio_engine.clone();
         tokio::spawn(
-            run_obp_connectivity_monitor(config.obp_api_base_url.clone(), engine_for_monitor)
+            run_obp_connectivity_monitor(config.obp_api_base_url_a.clone(), engine_for_monitor)
                 .instrument(agent_span.clone()),
         );
     }
@@ -444,7 +444,7 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
                 agent_name.clone(),
                 agent_address.clone(),
                 capabilities,
-                config.obp_api_base_url.clone(),
+                config.obp_api_base_url_a.clone(),
                 hs,
             )
             .instrument(agent_span.clone()),
@@ -475,7 +475,7 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
 
     // Reachability watchdog: force hotspot re-join after prolonged OBP loss
     {
-        let base = config.obp_api_base_url.clone();
+        let base = config.obp_api_base_url_a.clone();
         let hotspot = config.hotspot_profile_name.clone();
         let threshold = config.watchdog_fail_threshold;
         let interval = std::time::Duration::from_secs(config.watchdog_probe_interval_secs);
