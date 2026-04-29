@@ -55,9 +55,42 @@ fi
 OWNER="$(stat -c '%U' "$SCRIPT_DIR")"
 OWNER_GROUP="$(stat -c '%G' "$SCRIPT_DIR")"
 
+# Read TEST_PATTERN from the env file to decide which ExecStart variant
+# to bake into the unit. Defaults to test pattern if absent or empty —
+# safer because it has no capture-device dependency.
+TP_VAL="$(grep -E '^[[:space:]]*TEST_PATTERN[[:space:]]*=' "$ENV_FILE" \
+    | tail -1 | cut -d= -f2- | tr -d '"' | xargs || true)"
+case "$TP_VAL" in
+    0|false|no|off) USE_TEST_PATTERN=0 ;;
+    *)              USE_TEST_PATTERN=1 ;;
+esac
+
+if [ "$USE_TEST_PATTERN" = "1" ]; then
+    MODE_DESC="TEST PATTERN (lavfi testsrc2 + 1 kHz sine)"
+    EXEC_START="/usr/bin/ffmpeg -re \\
+    -f lavfi -i testsrc2=size=1280x720:rate=30 \\
+    -f lavfi -i sine=frequency=1000:sample_rate=48000 \\
+    -vcodec libx264 -preset veryfast \\
+    -b:v \${BITRATE_KBPS}k -minrate \${BITRATE_KBPS}k -maxrate \${BITRATE_KBPS}k \\
+    -bufsize \${BUFSIZE_KBPS}k -g 60 -keyint_min 60 \\
+    -acodec aac -b:a 128k -ar 48000 \\
+    -f flv \${RTMP_URL}/\${RTMP_STREAM_KEY}"
+else
+    MODE_DESC="CAPTURE (\${V4L2_DEVICE} + \${ALSA_DEVICE})"
+    EXEC_START="/usr/bin/ffmpeg \\
+    -f v4l2 -i \${V4L2_DEVICE} \\
+    -f alsa -i \${ALSA_DEVICE} \\
+    -vcodec libx264 -preset veryfast \\
+    -b:v \${BITRATE_KBPS}k -minrate \${BITRATE_KBPS}k -maxrate \${BITRATE_KBPS}k \\
+    -bufsize \${BUFSIZE_KBPS}k -g 60 -keyint_min 60 \\
+    -acodec aac -b:a 160k \\
+    -f flv \${RTMP_URL}/\${RTMP_STREAM_KEY}"
+fi
+
 echo "Project dir : $SCRIPT_DIR"
 echo "Run as user : $OWNER"
 echo "Env file    : $ENV_FILE"
+echo "Mode        : $MODE_DESC"
 
 # ── Write the systemd unit ──────────────────────────────────────────
 # `${VAR}` references are expanded by systemd at unit-execution time
@@ -74,14 +107,7 @@ User=$OWNER
 Group=$OWNER_GROUP
 SupplementaryGroups=audio video
 EnvironmentFile=$ENV_FILE
-ExecStart=/usr/bin/ffmpeg \\
-    -f v4l2 -i \${V4L2_DEVICE} \\
-    -f alsa -i \${ALSA_DEVICE} \\
-    -vcodec libx264 -preset veryfast \\
-    -b:v \${BITRATE_KBPS}k -minrate \${BITRATE_KBPS}k -maxrate \${BITRATE_KBPS}k \\
-    -bufsize \${BUFSIZE_KBPS}k -g 60 -keyint_min 60 \\
-    -acodec aac -b:a 160k \\
-    -f flv \${RTMP_URL}/\${RTMP_STREAM_KEY}
+ExecStart=$EXEC_START
 Restart=on-failure
 RestartSec=5
 
@@ -94,14 +120,18 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
+systemctl enable stream.service
+systemctl restart stream.service
 
 echo ""
-echo "Done. stream.service is installed."
+echo "Done. stream.service is installed, enabled at boot, and (re)started."
 echo ""
-echo "Note: the service is NOT enabled at boot. The agent controls it via"
-echo "      the OBP system-commands channel (stream-start / stream-stop)."
-echo "      You can also drive it manually for testing:"
+echo "Useful commands:"
+echo "  sudo systemctl status stream.service       # check if running"
+echo "  sudo journalctl -u stream.service -f       # follow logs"
+echo "  sudo systemctl restart stream.service      # restart"
+echo "  sudo systemctl stop stream.service         # stop (until next boot)"
+echo "  sudo systemctl disable stream.service      # disable auto-start at boot"
 echo ""
-echo "  sudo systemctl start stream.service"
-echo "  sudo journalctl -u stream.service -f"
-echo "  sudo systemctl stop stream.service"
+echo "To switch between test pattern and capture mode: edit TEST_PATTERN in"
+echo "$ENV_FILE and re-run this script."

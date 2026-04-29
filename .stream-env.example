@@ -2,6 +2,14 @@
 # Read by /etc/systemd/system/stream.service (installed via
 # install-stream-service.sh).
 
+# Mode toggle, read by install-stream-service.sh at install time.
+#   1 = synthetic test pattern (lavfi testsrc2 + 1 kHz sine) — needs no capture hardware
+#   0 = real capture (V4L2_DEVICE + ALSA_DEVICE)
+# Default if unset: test pattern (safe — no device dependency).
+# After flipping this value, re-run `sudo bash install-stream-service.sh`
+# to regenerate the systemd unit.
+TEST_PATTERN=1
+
 # RTMP endpoint URL (the part *before* the stream key).
 # Examples:
 #   rtmp://a.rtmp.youtube.com/live2              (YouTube — primary)

@@ -254,7 +254,7 @@ YouTube takes ~10–30s to show "live" in Studio after ffmpeg starts pushing. Us
 
 ### Install the systemd unit on a Pi
 
-Once the standalone ffmpeg works, the next layer is the agent-controllable `stream.service` unit:
+Once the standalone ffmpeg works, the next layer is the `stream.service` unit:
 
 ```
 cp .stream-env.example .stream-env       # then $EDITOR .stream-env
@@ -262,7 +262,12 @@ sudo apt install ffmpeg
 sudo bash install-stream-service.sh
 ```
 
-The service is intentionally NOT enabled at boot — the agent's `system-commands` channel handler starts/stops it on demand (or you can drive it manually with `systemctl start stream.service`, or via the CLI smoke-test commands above).
+The installer enables the service at boot — the Pi starts streaming as soon as it's online. `.stream-env` has a `TEST_PATTERN` flag:
+
+- `TEST_PATTERN=1` (default) — synthetic lavfi source (colour bars + 1 kHz sine), no capture hardware needed.
+- `TEST_PATTERN=0` — v4l2/alsa capture from `V4L2_DEVICE` and `ALSA_DEVICE`.
+
+After flipping the flag, re-run `sudo bash install-stream-service.sh` to regenerate the unit. The agent's `system-commands` channel handler can still start/stop the service on demand for the current boot, and the CLI smoke-test commands above (`cargo run -- stream {start,stop,status}`) drive it without going through OBP.
 
 ## Tests
 

@@ -62,7 +62,9 @@ ffmpeg \
 
 YouTube's primary RTMP ingest is `rtmp://a.rtmp.youtube.com/live2`; the backup is `rtmp://b.rtmp.youtube.com/live2?backup=1`. The stream key lives in YouTube Studio under Live → Stream → Stream key (use a "default stream" / persistent key for repeatable testing).
 
-Runs as a **systemd service** (`stream.service`, installed via `install-stream-service.sh`). The unit reads `RTMP_URL` and `RTMP_STREAM_KEY` from `.stream-env` so the key isn't baked into the unit file. The agent's `system-commands` handler starts and stops the service on demand; it is not enabled at boot.
+Runs as a **systemd service** (`stream.service`, installed via `install-stream-service.sh`). The unit reads `RTMP_URL` and `RTMP_STREAM_KEY` from `.stream-env` so the key isn't baked into the unit file.
+
+The installer enables the service at boot — the Pi starts streaming as soon as it's online. A `TEST_PATTERN=1` flag in `.stream-env` selects a synthetic lavfi source (colour bars + 1 kHz sine) so this works even without capture hardware connected; flip to `TEST_PATTERN=0` and re-run the installer to switch to v4l2/alsa capture. The agent's `system-commands` handler can also start/stop the service on demand for the duration of the current boot.
 
 ### OBS Settings (for reference, if OBS ever used)
 - Encoder: x264 or NVENC
@@ -155,7 +157,7 @@ Switching WiFi from a remote command is dangerous: a wrong SSID/PSK leaves the P
 **Done in this repo:**
 - `src/system_commands/` module — `mod.rs` (poller + dispatch), `wifi.rs` (nmcli confirm-or-revert), `stream.rs` (`systemctl` wrappers), `watchdog.rs` (reachability + forced hotspot fallback)
 - Wired into `agent.rs` alongside the existing task-request poller
-- `install-stream-service.sh` + `.stream-env.example` — generates `/etc/systemd/system/stream.service` from per-Pi env (RTMP_URL, RTMP_STREAM_KEY, V4L2_DEVICE, ALSA_DEVICE, BITRATE_KBPS, BUFSIZE_KBPS). The unit is intentionally NOT enabled at boot — the agent controls start/stop on demand
+- `install-stream-service.sh` + `.stream-env.example` — generates `/etc/systemd/system/stream.service` from per-Pi env (RTMP_URL, RTMP_STREAM_KEY, TEST_PATTERN, V4L2_DEVICE, ALSA_DEVICE, BITRATE_KBPS, BUFSIZE_KBPS). The installer enables the unit at boot. `TEST_PATTERN=1` (default) picks a synthetic lavfi source so it works without capture hardware; `TEST_PATTERN=0` switches to v4l2/alsa capture
 - `cargo run -- stream <start|stop|status>` — CLI smoke-test for the systemctl wrappers without going through OBP
 
 **Per-Pi setup (manual):**
