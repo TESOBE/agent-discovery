@@ -102,7 +102,12 @@ pub fn tx_amplitude(announce_count: u64) -> f32 {
 }
 
 /// Compute TX amplitude scaled to the measured noise floor and an isolation
-/// multiplier (≥1.0; bumps amplitude when no peer has been heard recently).
+/// multiplier (≥1.0; bumps amplitude when no peer has been heard recently),
+/// compensated by `tx_to_mic_gain` — the empirically measured ratio of
+/// "RMS the mic hears from us" to "amplitude we sent to the speaker".
+///
+/// Pass `tx_to_mic_gain = 0.0` to mean "not yet calibrated"; the function
+/// falls back to assuming a unit transfer (the legacy uncalibrated path).
 ///
 /// During the first `CHIRP_RAMP_STEPS` announces the warm-up curve from
 /// `tx_amplitude` acts as a ceiling so the very first transmissions stay
@@ -111,19 +116,29 @@ pub fn tx_amplitude_from_noise(
     announce_count: u64,
     noise_rms: f32,
     isolation_mult: f32,
+    tx_to_mic_gain: f32,
 ) -> f32 {
-    let base = (noise_rms * CHIRP_SNR_GAIN)
-        .clamp(CHIRP_AMPLITUDE_FLOOR, CHIRP_AMPLITUDE_MAX);
+    // Target RMS at the mic: SNR_GAIN above the noise floor, multiplied by
+    // the isolation factor so an alone agent aims for a louder landing.
+    let target_self_rms = noise_rms * CHIRP_SNR_GAIN * isolation_mult;
     let cap = if isolation_mult > 1.0 {
         CHIRP_AMPLITUDE_ISOLATED_CAP
     } else {
         CHIRP_AMPLITUDE_MAX
     };
-    let boosted = (base * isolation_mult).clamp(CHIRP_AMPLITUDE_FLOOR, cap);
-    if announce_count < CHIRP_RAMP_STEPS {
-        boosted.min(tx_amplitude(announce_count))
+    // Convert target mic-RMS back to a speaker-amplitude using the measured
+    // transfer factor. Uncalibrated (gain≈0) falls back to the legacy
+    // assumption that amplitude == target mic RMS.
+    let raw_amp = if tx_to_mic_gain > 0.001 {
+        target_self_rms / tx_to_mic_gain
     } else {
-        boosted
+        target_self_rms
+    };
+    let amp = raw_amp.clamp(CHIRP_AMPLITUDE_FLOOR, cap);
+    if announce_count < CHIRP_RAMP_STEPS {
+        amp.min(tx_amplitude(announce_count))
+    } else {
+        amp
     }
 }
 

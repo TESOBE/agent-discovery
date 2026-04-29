@@ -321,6 +321,15 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
     // Unix-seconds of the last hello heard from any peer (0 = never).
     // TX reads this to compute the isolation multiplier — louder when alone.
     let last_hello_heard_secs = Arc::new(AtomicU64::new(0));
+    // Empirically measured speaker→mic transfer gain × 10000.
+    // 0 = uncalibrated (no self-listen measurement yet — TX falls back to the
+    // legacy uncalibrated formula). RX accumulates self-RMS during own TX
+    // and EMAs an updated gain after each chirp.
+    let tx_to_mic_gain_milli = Arc::new(AtomicU32::new(0));
+    // Amplitude (×10000) the announce loop most recently sent to the speaker.
+    // RX reads this when finalising self-listen calibration to compute
+    // gain = self_rms / sent_amplitude.
+    let tx_amplitude_milli = Arc::new(AtomicU32::new(0));
 
     // Start audio loops (skipped with --udp)
     if !udp_only {
@@ -336,8 +345,10 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
             let ce_flag = channel_energy.clone();
             let nf_flag = noise_floor_milli.clone();
             let lh_flag = last_hello_heard_secs.clone();
+            let gain_flag = tx_to_mic_gain_milli.clone();
+            let amp_flag = tx_amplitude_milli.clone();
             tokio::spawn(
-                run_announce_loop(mgr, eng, tx_flag, pf_flag, hs_flag, sig, name, ce_flag, nf_flag, lh_flag)
+                run_announce_loop(mgr, eng, tx_flag, pf_flag, hs_flag, sig, name, ce_flag, nf_flag, lh_flag, gain_flag, amp_flag)
                     .instrument(agent_span.clone()),
             );
         }
@@ -351,8 +362,10 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
             let ce_flag = channel_energy.clone();
             let nf_flag = noise_floor_milli.clone();
             let lh_flag = last_hello_heard_secs.clone();
+            let gain_flag = tx_to_mic_gain_milli.clone();
+            let amp_flag = tx_amplitude_milli.clone();
             tokio::spawn(
-                run_receive_loop(mgr, eng, tx_flag, pf_flag, actual_port, ce_flag, nf_flag, lh_flag)
+                run_receive_loop(mgr, eng, tx_flag, pf_flag, actual_port, ce_flag, nf_flag, lh_flag, gain_flag, amp_flag)
                     .instrument(agent_span.clone()),
             );
         }
@@ -2466,6 +2479,8 @@ async fn run_announce_loop(
     channel_energy: Arc<AtomicU32>,
     noise_floor_milli: Arc<AtomicU32>,
     last_hello_heard_secs: Arc<AtomicU64>,
+    tx_to_mic_gain_milli: Arc<AtomicU32>,
+    tx_amplitude_milli: Arc<AtomicU32>,
 ) {
     use crate::audio::chirp;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2538,12 +2553,12 @@ async fn run_announce_loop(
             );
         }
 
-        // Noise-floor- and isolation-aware amplitude.
-        // - noise_rms: RMS of room background measured by RX (0.0 if not yet sampled).
-        // - isolation_mult: 1.0 if a peer was heard within the last 5 min,
-        //   1.5 within 5–15 min, 2.0 if longer or never.
-        // The warm-up ramp from `tx_amplitude` still acts as a ceiling for
-        // the first few announces (see `tx_amplitude_from_noise`).
+        // Noise-floor- and isolation-aware amplitude, compensated by the
+        // closed-loop measured speaker→mic transfer gain (so the chirp lands
+        // at the same RMS regardless of system volume / hardware).
+        // - noise_rms: RMS of room background, measured by RX.
+        // - isolation_mult: 1.0 within 5 min of last peer, 1.5 ≤15 min, else 2.0.
+        // - tx_to_mic_gain: 0.0 = uncalibrated (legacy fallback in chirp::).
         let noise_rms = noise_floor_milli.load(Ordering::Acquire) as f32 / 10000.0;
         let last_heard = last_hello_heard_secs.load(Ordering::Acquire);
         let now_secs = SystemTime::now()
@@ -2551,10 +2566,20 @@ async fn run_announce_loop(
             .unwrap_or_default()
             .as_secs();
         let isolation_mult = isolation_multiplier(now_secs, last_heard);
-        let amplitude = chirp::tx_amplitude_from_noise(announce_count, noise_rms, isolation_mult);
+        let tx_to_mic_gain = tx_to_mic_gain_milli.load(Ordering::Acquire) as f32 / 10000.0;
+        let amplitude = chirp::tx_amplitude_from_noise(
+            announce_count,
+            noise_rms,
+            isolation_mult,
+            tx_to_mic_gain,
+        );
+        // Publish the amplitude we're about to send so RX can divide its
+        // self-listened RMS by it to compute the new gain estimate.
+        tx_amplitude_milli.store((amplitude * 10000.0) as u32, Ordering::Release);
         tracing::debug!(
             noise_rms = format!("{:.4}", noise_rms),
             isolation_mult = format!("{:.1}", isolation_mult),
+            tx_to_mic_gain = format!("{:.3}", tx_to_mic_gain),
             amplitude = format!("{:.2}", amplitude),
             "TX: chirp amplitude"
         );
@@ -2667,6 +2692,8 @@ async fn run_receive_loop(
     channel_energy: Arc<AtomicU32>,
     noise_floor_milli: Arc<AtomicU32>,
     last_hello_heard_secs: Arc<AtomicU64>,
+    tx_to_mic_gain_milli: Arc<AtomicU32>,
+    tx_amplitude_milli: Arc<AtomicU32>,
 ) {
     use crate::audio::chirp;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2700,6 +2727,14 @@ async fn run_receive_loop(
     let mut noise_buffer: std::collections::VecDeque<f32> =
         std::collections::VecDeque::with_capacity(NOISE_BUFFER_LEN);
 
+    // Closed-loop self-listen calibration: while we transmit, accumulate
+    // sum-of-squares from the mic. On TX completion, divide RMS by the
+    // amplitude announce sent → instantaneous transfer gain. EMA into the
+    // shared `tx_to_mic_gain_milli`.
+    const GAIN_EMA_ALPHA: f32 = 0.4;
+    let mut tx_self_sum_sq: f64 = 0.0;
+    let mut tx_self_samples: usize = 0;
+
     // Minimum buffer: a binary chirp message is 52 × 100ms ≈ 5.2s
     let min_msg_samples = (sample_rate as f32 * 5.0) as usize;
 
@@ -2717,7 +2752,8 @@ async fn run_receive_loop(
                     peak = abs;
                 }
             }
-            if !is_transmitting.load(Ordering::Acquire) {
+            let tx_now = is_transmitting.load(Ordering::Acquire);
+            if !tx_now {
                 sample_buffer.extend_from_slice(&chunk);
                 // Track carrier-sense peak from incoming audio (only when we're not TX)
                 for &s in &chunk {
@@ -2732,6 +2768,13 @@ async fn run_receive_loop(
                         noise_window_sum_sq += (s as f64) * (s as f64);
                         noise_window_samples += 1;
                     }
+                }
+            } else {
+                // We're transmitting: accumulate self-listen energy for closed-loop
+                // calibration of the speaker→mic transfer gain.
+                for &s in &chunk {
+                    tx_self_sum_sq += (s as f64) * (s as f64);
+                    tx_self_samples += 1;
                 }
             }
         }
@@ -2815,6 +2858,39 @@ async fn run_receive_loop(
             post_tx_cooldown = std::time::Instant::now();
             sample_buffer.clear();
             tracing::debug!("RX: Post-TX cooldown (300ms)");
+
+            // Finalise closed-loop self-listen calibration for the chirp
+            // we just transmitted. self_rms / sent_amp is the instantaneous
+            // speaker→mic transfer gain; EMA it into the shared atomic.
+            if tx_self_samples > 0 {
+                let self_rms = (tx_self_sum_sq / tx_self_samples as f64).sqrt() as f32;
+                let sent_amp =
+                    tx_amplitude_milli.load(Ordering::Acquire) as f32 / 10000.0;
+                if sent_amp > 0.001 {
+                    let instant_gain = self_rms / sent_amp;
+                    let prev_gain =
+                        tx_to_mic_gain_milli.load(Ordering::Acquire) as f32 / 10000.0;
+                    let new_gain = if prev_gain <= 0.0 {
+                        // First measurement — seed directly, no EMA yet.
+                        instant_gain
+                    } else {
+                        (1.0 - GAIN_EMA_ALPHA) * prev_gain
+                            + GAIN_EMA_ALPHA * instant_gain
+                    };
+                    tx_to_mic_gain_milli
+                        .store((new_gain * 10000.0) as u32, Ordering::Release);
+                    tracing::info!(
+                        self_rms = format!("{:.4}", self_rms),
+                        sent_amp = format!("{:.2}", sent_amp),
+                        instant_gain = format!("{:.3}", instant_gain),
+                        ema_gain = format!("{:.3}", new_gain),
+                        samples = tx_self_samples,
+                        "RX: TX self-listen calibration"
+                    );
+                }
+            }
+            tx_self_sum_sq = 0.0;
+            tx_self_samples = 0;
         }
 
         // Don't try decoding during cooldown
