@@ -1,0 +1,32 @@
+# .stream-env.example — copy to .stream-env and fill in.
+# Read by /etc/systemd/system/stream.service (installed via
+# install-stream-service.sh).
+
+# RTMP endpoint URL (the part *before* the stream key).
+# Examples:
+#   rtmp://a.rtmp.youtube.com/live2              (YouTube — primary)
+#   rtmp://b.rtmp.youtube.com/live2?backup=1     (YouTube — backup)
+#   rtmp://live.twitch.tv/app
+#   rtmp://live.restream.io/live
+RTMP_URL=rtmp://a.rtmp.youtube.com/live2
+
+# RTMP stream key (the secret). For YouTube: find it in YouTube Studio under
+# Live → Stream → Stream key. Use a TEST key while validating the pipeline.
+# The full destination given to ffmpeg is ${RTMP_URL}/${RTMP_STREAM_KEY}.
+RTMP_STREAM_KEY=REPLACE_ME
+
+# Video capture device. /dev/video0 is the first USB capture (ATEM Mini Pro
+# typically lands here).
+V4L2_DEVICE=/dev/video0
+
+# ALSA capture device for audio in (from the ATEM USB feed).
+# Verify with: arecord -l
+# May be hw:1, hw:2, etc., depending on what's plugged in.
+ALSA_DEVICE=hw:0
+
+# Output video bitrate in kbps. 5500 ≈ 5.5 Mbps — fine for 1080p30 on a
+# decent connection. Drop to 3000 for a phone hotspot if you want headroom.
+BITRATE_KBPS=5500
+
+# Rate-control buffer size in kbps. Roughly 2× bitrate.
+BUFSIZE_KBPS=11000
