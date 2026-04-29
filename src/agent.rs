@@ -1,6 +1,6 @@
 /// Agent orchestrator: ties audio, discovery, negotiation, and OBP together.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context as _, Result};
@@ -314,6 +314,13 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
     let handshake_done = Arc::new(AtomicBool::new(false));
     // Audio energy level measured by RX loop — TX reads this for carrier-sense
     let channel_energy = Arc::new(AtomicU32::new(0));
+    // Noise-floor RMS encoded as `rms * 10000.0`. Sampled by RX every ~60s
+    // during a quiet 1s window, kept as the min over the last 5 readings.
+    // TX reads this to scale chirp amplitude (see `tx_amplitude_from_noise`).
+    let noise_floor_milli = Arc::new(AtomicU32::new(0));
+    // Unix-seconds of the last hello heard from any peer (0 = never).
+    // TX reads this to compute the isolation multiplier — louder when alone.
+    let last_hello_heard_secs = Arc::new(AtomicU64::new(0));
 
     // Start audio loops (skipped with --udp)
     if !udp_only {
@@ -327,8 +334,10 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
             let sig = chirp_sig.clone();
             let name = agent_name.clone();
             let ce_flag = channel_energy.clone();
+            let nf_flag = noise_floor_milli.clone();
+            let lh_flag = last_hello_heard_secs.clone();
             tokio::spawn(
-                run_announce_loop(mgr, eng, tx_flag, pf_flag, hs_flag, sig, name, ce_flag)
+                run_announce_loop(mgr, eng, tx_flag, pf_flag, hs_flag, sig, name, ce_flag, nf_flag, lh_flag)
                     .instrument(agent_span.clone()),
             );
         }
@@ -340,8 +349,10 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
             let tx_flag = is_transmitting.clone();
             let pf_flag = peer_found.clone();
             let ce_flag = channel_energy.clone();
+            let nf_flag = noise_floor_milli.clone();
+            let lh_flag = last_hello_heard_secs.clone();
             tokio::spawn(
-                run_receive_loop(mgr, eng, tx_flag, pf_flag, actual_port, ce_flag)
+                run_receive_loop(mgr, eng, tx_flag, pf_flag, actual_port, ce_flag, nf_flag, lh_flag)
                     .instrument(agent_span.clone()),
             );
         }
@@ -2400,6 +2411,23 @@ impl Rng {
     }
 }
 
+/// Multiplier applied to chirp amplitude based on isolation: how long it has
+/// been since this agent heard any peer hello. Louder when alone, normal
+/// when in recent contact. Returns 2.0 if no peer has ever been heard.
+fn isolation_multiplier(now_secs: u64, last_hello_heard_secs: u64) -> f32 {
+    if last_hello_heard_secs == 0 {
+        return 2.0;
+    }
+    let elapsed_min = now_secs.saturating_sub(last_hello_heard_secs) / 60;
+    if elapsed_min <= 5 {
+        1.0
+    } else if elapsed_min <= 15 {
+        1.5
+    } else {
+        2.0
+    }
+}
+
 /// Derive a fixed second from an agent name using FNV-1a hash.
 /// Returns one of 0, 10, 20, 30, 40, 50 — giving 6 slots per minute,
 /// each 10 seconds apart, so agents never transmit at the same time.
@@ -2436,6 +2464,8 @@ async fn run_announce_loop(
     chirp_sig: crate::audio::chirp::AgentChirpSignature,
     agent_name: String,
     channel_energy: Arc<AtomicU32>,
+    noise_floor_milli: Arc<AtomicU32>,
+    last_hello_heard_secs: Arc<AtomicU64>,
 ) {
     use crate::audio::chirp;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -2508,8 +2538,26 @@ async fn run_announce_loop(
             );
         }
 
-        // Progressive amplitude ramp
-        let amplitude = chirp::tx_amplitude(announce_count);
+        // Noise-floor- and isolation-aware amplitude.
+        // - noise_rms: RMS of room background measured by RX (0.0 if not yet sampled).
+        // - isolation_mult: 1.0 if a peer was heard within the last 5 min,
+        //   1.5 within 5–15 min, 2.0 if longer or never.
+        // The warm-up ramp from `tx_amplitude` still acts as a ceiling for
+        // the first few announces (see `tx_amplitude_from_noise`).
+        let noise_rms = noise_floor_milli.load(Ordering::Acquire) as f32 / 10000.0;
+        let last_heard = last_hello_heard_secs.load(Ordering::Acquire);
+        let now_secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let isolation_mult = isolation_multiplier(now_secs, last_heard);
+        let amplitude = chirp::tx_amplitude_from_noise(announce_count, noise_rms, isolation_mult);
+        tracing::debug!(
+            noise_rms = format!("{:.4}", noise_rms),
+            isolation_mult = format!("{:.1}", isolation_mult),
+            amplitude = format!("{:.2}", amplitude),
+            "TX: chirp amplitude"
+        );
 
         // Build the "hello" message: signature chirp + binary data
         let mgr = manager.lock().await;
@@ -2524,7 +2572,7 @@ async fn run_announce_loop(
 
         let caps_desc = crate::protocol::message::Capabilities(caps).describe();
 
-        let binary_msg = chirp::encode_chirp_message(port, caps, minutes_between_hellos as u8, sample_rate);
+        let binary_msg = chirp::encode_chirp_message_at(port, caps, minutes_between_hellos as u8, sample_rate, amplitude);
         let call_samples = chirp_sig.call_chirp(sample_rate, amplitude);
 
         let mut samples_to_send = Vec::with_capacity(
@@ -2617,8 +2665,11 @@ async fn run_receive_loop(
     peer_found: Arc<AtomicBool>,
     own_port: u16,
     channel_energy: Arc<AtomicU32>,
+    noise_floor_milli: Arc<AtomicU32>,
+    last_hello_heard_secs: Arc<AtomicU64>,
 ) {
     use crate::audio::chirp;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     let sample_rate = crate::audio::modulator::SAMPLE_RATE;
     let mut sample_buffer = Vec::new();
@@ -2634,6 +2685,20 @@ async fn run_receive_loop(
     // Carrier-sense: track channel energy for the TX loop
     let mut cs_peak: f32 = 0.0;
     let mut last_cs_update = std::time::Instant::now();
+
+    // Noise-floor sampling: every ~60s, accumulate 1s of RMS during a quiet
+    // (non-TX, non-cooldown) window. Keep the last 5 readings; the published
+    // noise floor is min(buffer) so transient sounds drop out automatically.
+    const NOISE_SAMPLE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+    const NOISE_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
+    const NOISE_BUFFER_LEN: usize = 5;
+    let mut next_noise_sample_at =
+        std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut noise_window_started: Option<std::time::Instant> = None;
+    let mut noise_window_sum_sq: f64 = 0.0;
+    let mut noise_window_samples: usize = 0;
+    let mut noise_buffer: std::collections::VecDeque<f32> =
+        std::collections::VecDeque::with_capacity(NOISE_BUFFER_LEN);
 
     // Minimum buffer: a binary chirp message is 52 × 100ms ≈ 5.2s
     let min_msg_samples = (sample_rate as f32 * 5.0) as usize;
@@ -2661,7 +2726,57 @@ async fn run_receive_loop(
                         cs_peak = abs;
                     }
                 }
+                // Accumulate noise-floor samples if a measurement window is open.
+                if noise_window_started.is_some() {
+                    for &s in &chunk {
+                        noise_window_sum_sq += (s as f64) * (s as f64);
+                        noise_window_samples += 1;
+                    }
+                }
             }
+        }
+
+        // Noise-floor sampling state machine: open a 1s measurement window
+        // every NOISE_SAMPLE_INTERVAL when the channel is quiet (not TX,
+        // not in post-TX cooldown). Close it after NOISE_WINDOW and push
+        // RMS to the rolling buffer; published noise floor = min(buffer).
+        let now_inst = std::time::Instant::now();
+        match noise_window_started {
+            None => {
+                if now_inst >= next_noise_sample_at
+                    && !is_transmitting.load(Ordering::Acquire)
+                    && post_tx_cooldown.elapsed() >= std::time::Duration::from_millis(300)
+                {
+                    noise_window_started = Some(now_inst);
+                    noise_window_sum_sq = 0.0;
+                    noise_window_samples = 0;
+                }
+            }
+            Some(started) if now_inst.duration_since(started) >= NOISE_WINDOW => {
+                if noise_window_samples > 0 {
+                    let mean_sq = noise_window_sum_sq / noise_window_samples as f64;
+                    let rms = mean_sq.sqrt() as f32;
+                    if noise_buffer.len() == NOISE_BUFFER_LEN {
+                        noise_buffer.pop_front();
+                    }
+                    noise_buffer.push_back(rms);
+                    let floor = noise_buffer
+                        .iter()
+                        .copied()
+                        .fold(f32::INFINITY, f32::min);
+                    noise_floor_milli.store((floor * 10000.0) as u32, Ordering::Release);
+                    tracing::info!(
+                        rms = format!("{:.4}", rms),
+                        floor = format!("{:.4}", floor),
+                        samples = noise_window_samples,
+                        readings = noise_buffer.len(),
+                        "RX: noise-floor sample"
+                    );
+                }
+                noise_window_started = None;
+                next_noise_sample_at = now_inst + NOISE_SAMPLE_INTERVAL;
+            }
+            Some(_) => {}
         }
 
         // Publish carrier-sense energy and decay every 200ms
@@ -2673,8 +2788,10 @@ async fn run_receive_loop(
 
         // Log audio stats every 10 seconds
         if last_peak_log.elapsed() > std::time::Duration::from_secs(10) {
+            let floor = noise_floor_milli.load(Ordering::Acquire) as f32 / 10000.0;
             tracing::info!(
                 peak = format!("{:.4}", peak),
+                noise_floor = format!("{:.4}", floor),
                 buffer = sample_buffer.len(),
                 decodes = decode_attempts,
                 hellos = hellos_heard,
@@ -2718,6 +2835,11 @@ async fn run_receive_loop(
                 }
 
                 hellos_heard += 1;
+                let now_unix = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                last_hello_heard_secs.store(now_unix, Ordering::Release);
                 let address = format!("127.0.0.1:{}", port);
                 let caps_desc = crate::protocol::message::Capabilities(caps).describe();
                 tracing::info!(

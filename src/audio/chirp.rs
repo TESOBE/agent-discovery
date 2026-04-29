@@ -31,6 +31,16 @@ pub const CHIRP_AMPLITUDE_MIN: f32 = 0.50;
 pub const CHIRP_AMPLITUDE_MAX: f32 = 0.80;
 pub const CHIRP_RAMP_STEPS: u64 = 3;
 
+/// Noise-floor-aware TX amplitude parameters (see `tx_amplitude_from_noise`).
+/// Target SNR margin (≈20 dB) above the measured noise floor RMS.
+pub const CHIRP_SNR_GAIN: f32 = 10.0;
+/// Floor for the chirp amplitude even in a very quiet room — too low and
+/// nearby agents won't hear it at all.
+pub const CHIRP_AMPLITUDE_FLOOR: f32 = 0.15;
+/// Cap raised to this value when the agent is isolated (no peer heard
+/// recently); otherwise the cap is `CHIRP_AMPLITUDE_MAX`.
+pub const CHIRP_AMPLITUDE_ISOLATED_CAP: f32 = 0.95;
+
 /// Minimum floor for chirp detection correlation.
 /// The adaptive threshold (see `AdaptiveThreshold`) tracks the noise floor
 /// and sets the effective threshold above it. This constant is the absolute
@@ -89,6 +99,32 @@ pub fn tx_amplitude(announce_count: u64) -> f32 {
     }
     let t = announce_count as f32 / CHIRP_RAMP_STEPS as f32;
     CHIRP_AMPLITUDE_MIN + t * (CHIRP_AMPLITUDE_MAX - CHIRP_AMPLITUDE_MIN)
+}
+
+/// Compute TX amplitude scaled to the measured noise floor and an isolation
+/// multiplier (≥1.0; bumps amplitude when no peer has been heard recently).
+///
+/// During the first `CHIRP_RAMP_STEPS` announces the warm-up curve from
+/// `tx_amplitude` acts as a ceiling so the very first transmissions stay
+/// gentle. Past that, the only ceiling is the isolation cap.
+pub fn tx_amplitude_from_noise(
+    announce_count: u64,
+    noise_rms: f32,
+    isolation_mult: f32,
+) -> f32 {
+    let base = (noise_rms * CHIRP_SNR_GAIN)
+        .clamp(CHIRP_AMPLITUDE_FLOOR, CHIRP_AMPLITUDE_MAX);
+    let cap = if isolation_mult > 1.0 {
+        CHIRP_AMPLITUDE_ISOLATED_CAP
+    } else {
+        CHIRP_AMPLITUDE_MAX
+    };
+    let boosted = (base * isolation_mult).clamp(CHIRP_AMPLITUDE_FLOOR, cap);
+    if announce_count < CHIRP_RAMP_STEPS {
+        boosted.min(tx_amplitude(announce_count))
+    } else {
+        boosted
+    }
 }
 
 /// Generate a CALL chirp (800-3200 Hz) at a specific amplitude.
@@ -728,25 +764,37 @@ const PREAMBLE: [u8; 8] = [1, 0, 1, 0, 1, 0, 1, 0];
 /// Sync word: four 1-bits in a row signals "data starts next".
 const SYNC: [u8; 4] = [1, 1, 1, 1];
 
-/// Generate an up-chirp (1500→2500 Hz) representing bit=1.
+/// Generate an up-chirp (1500→2500 Hz) representing bit=1, at the default
+/// amplitude. Used as a correlation template by decoders.
 pub fn data_up_chirp(sample_rate: u32) -> Vec<f32> {
+    data_up_chirp_at(sample_rate, DATA_CHIRP_AMPLITUDE)
+}
+
+/// Generate an up-chirp at the given amplitude (used for TX).
+pub fn data_up_chirp_at(sample_rate: u32, amplitude: f32) -> Vec<f32> {
     generate_chirp(
         DATA_START_FREQ,
         DATA_END_FREQ,
         DATA_CHIRP_DURATION,
         sample_rate,
-        DATA_CHIRP_AMPLITUDE,
+        amplitude,
     )
 }
 
-/// Generate a down-chirp (2500→1500 Hz) representing bit=0.
+/// Generate a down-chirp (2500→1500 Hz) representing bit=0, at the default
+/// amplitude. Used as a correlation template by decoders.
 pub fn data_down_chirp(sample_rate: u32) -> Vec<f32> {
+    data_down_chirp_at(sample_rate, DATA_CHIRP_AMPLITUDE)
+}
+
+/// Generate a down-chirp at the given amplitude (used for TX).
+pub fn data_down_chirp_at(sample_rate: u32, amplitude: f32) -> Vec<f32> {
     generate_chirp(
         DATA_END_FREQ,
         DATA_START_FREQ,
         DATA_CHIRP_DURATION,
         sample_rate,
-        DATA_CHIRP_AMPLITUDE,
+        amplitude,
     )
 }
 
@@ -756,8 +804,13 @@ pub fn data_down_chirp(sample_rate: u32) -> Vec<f32> {
 ///   [preamble: 10101010] [sync: 1111] [port: 16 bits MSB] [caps: 8 bits] [next_hello_mins: 8 bits] [checksum: 8 bits]
 ///   Total: 52 bit slots = ~5.2 seconds of audio (100ms per bit slot)
 pub fn encode_chirp_message(port: u16, capabilities: u8, next_hello_mins: u8, sample_rate: u32) -> Vec<f32> {
-    let up = data_up_chirp(sample_rate);
-    let down = data_down_chirp(sample_rate);
+    encode_chirp_message_at(port, capabilities, next_hello_mins, sample_rate, DATA_CHIRP_AMPLITUDE)
+}
+
+/// Encode a binary chirp message at the given amplitude (for noise-floor-aware TX).
+pub fn encode_chirp_message_at(port: u16, capabilities: u8, next_hello_mins: u8, sample_rate: u32, amplitude: f32) -> Vec<f32> {
+    let up = data_up_chirp_at(sample_rate, amplitude);
+    let down = data_down_chirp_at(sample_rate, amplitude);
     let gap_samples = (DATA_CHIRP_GAP * sample_rate as f32) as usize;
     let gap = vec![0.0f32; gap_samples];
 
