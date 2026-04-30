@@ -2611,7 +2611,7 @@ async fn run_announce_loop(
         if !obp_url.is_empty() {
             let chunks = chirp::split_url_into_chunks(&obp_url);
             let chunk = &chunks[url_chunk_index % chunks.len()];
-            let chunk_chirp = chirp::encode_chirp_url_chunk(chunk, sample_rate);
+            let chunk_chirp = chirp::encode_chirp_url_chunk_at(chunk, sample_rate, amplitude);
             let chunk_duration = chunk_chirp.len() as f32 / sample_rate as f32;
             tracing::info!(
                 "TX: Sending URL chunk {}/{} (~{:.1}s)",

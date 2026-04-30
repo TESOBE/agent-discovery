@@ -27,19 +27,19 @@ pub const RESPONSE_END_FREQ: f32 = 6400.0;
 
 /// Progressive volume ramp for TX chirps.
 /// Starts at a moderate level for faster discovery.
-pub const CHIRP_AMPLITUDE_MIN: f32 = 0.50;
-pub const CHIRP_AMPLITUDE_MAX: f32 = 0.80;
+pub const CHIRP_AMPLITUDE_MIN: f32 = 0.25;
+pub const CHIRP_AMPLITUDE_MAX: f32 = 0.45;
 pub const CHIRP_RAMP_STEPS: u64 = 3;
 
 /// Noise-floor-aware TX amplitude parameters (see `tx_amplitude_from_noise`).
-/// Target SNR margin (≈20 dB) above the measured noise floor RMS.
-pub const CHIRP_SNR_GAIN: f32 = 10.0;
+/// Target SNR margin (≈14 dB) above the measured noise floor RMS.
+pub const CHIRP_SNR_GAIN: f32 = 5.0;
 /// Floor for the chirp amplitude even in a very quiet room — too low and
 /// nearby agents won't hear it at all.
-pub const CHIRP_AMPLITUDE_FLOOR: f32 = 0.15;
+pub const CHIRP_AMPLITUDE_FLOOR: f32 = 0.10;
 /// Cap raised to this value when the agent is isolated (no peer heard
 /// recently); otherwise the cap is `CHIRP_AMPLITUDE_MAX`.
-pub const CHIRP_AMPLITUDE_ISOLATED_CAP: f32 = 0.95;
+pub const CHIRP_AMPLITUDE_ISOLATED_CAP: f32 = 0.60;
 
 /// Minimum floor for chirp detection correlation.
 /// The adaptive threshold (see `AdaptiveThreshold`) tracks the noise floor
@@ -1256,8 +1256,13 @@ pub fn split_url_into_chunks(url: &str) -> Vec<UrlChunk> {
 ///
 /// Total bits per chunk: 8+4+4+4+4+N×8+8 = 32 + N×8 bits (max 80 bits = 8s for 6 bytes)
 pub fn encode_chirp_url_chunk(chunk: &UrlChunk, sample_rate: u32) -> Vec<f32> {
-    let up = data_up_chirp(sample_rate);
-    let down = data_down_chirp(sample_rate);
+    encode_chirp_url_chunk_at(chunk, sample_rate, DATA_CHIRP_AMPLITUDE)
+}
+
+/// Encode a URL chunk into a binary chirp audio burst at the given amplitude.
+pub fn encode_chirp_url_chunk_at(chunk: &UrlChunk, sample_rate: u32, amplitude: f32) -> Vec<f32> {
+    let up = data_up_chirp_at(sample_rate, amplitude);
+    let down = data_down_chirp_at(sample_rate, amplitude);
     let gap_samples = (DATA_CHIRP_GAP * sample_rate as f32) as usize;
     let gap = vec![0.0f32; gap_samples];
 
