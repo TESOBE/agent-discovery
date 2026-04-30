@@ -16,6 +16,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Non-interactive SSH shells skip ~/.bashrc, so cargo isn't on PATH unless we
+# source its env explicitly.
+if [ -f "$HOME/.cargo/env" ]; then
+    # shellcheck disable=SC1091
+    . "$HOME/.cargo/env"
+fi
+
 echo "==> git pull"
 git pull --ff-only
 
