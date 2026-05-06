@@ -457,14 +457,16 @@ pub async fn diagnose_audio_to_signal(config: &Config) -> Result<()> {
 
     println!("{}", info);
 
-    // Post to OBP signal channel
-    let obp = match crate::obp::client::ObpClient::new(config) {
-        Ok(c) => c,
-        Err(e) => {
-            println!("OBP client unavailable (skipping signal post): {}", e);
+    // Post to OBP signal channel via the first configured host (diagnostics
+    // is single-shot; we don't need multi-host fan-out here).
+    let host = match config.obp_hosts.first() {
+        Some(h) => h.clone(),
+        None => {
+            println!("No OBP host configured (skipping signal post)");
             return Ok(());
         }
     };
+    let obp = crate::obp::client::ObpClient::new(host);
     match obp.authenticate().await {
         Ok(()) => {
             let payload = serde_json::json!({

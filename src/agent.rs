@@ -10,6 +10,7 @@ use uuid::Uuid;
 use crate::audio::device::AudioEngine;
 use crate::audio::modulator::{band_from_name, BANDS};
 use crate::comms::channel::CommChannel;
+use crate::comms::handshake::{agent_inbox_channel, HandshakeChannel, SignalHandshakeChannel};
 use crate::comms::tcp::{TcpChannel, TcpCommListener};
 use crate::config::Config;
 use crate::discovery::manager::{DiscoveryConfig, DiscoveryEvent, DiscoveryManager};
@@ -187,24 +188,35 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
         }
     };
 
-    // Set up OBP client for direct HTTP calls (entity record creation)
-    eprintln!("[early] setting up OBP client...");
-    let obp_client = match ObpClient::new(&config) {
-        Ok(client) => match client.authenticate().await {
+    // Set up one OBP client per configured host. Each runs its own pollers,
+    // presence publisher, and handshake routes. Hosts that fail auth keep
+    // their client around — the pollers retry lazily on every iteration.
+    eprintln!("[early] setting up OBP clients...");
+    let mut obp_clients: Vec<Arc<ObpClient>> = Vec::new();
+    let mut first_authenticated: Option<Arc<ObpClient>> = None;
+    for host in &config.obp_hosts {
+        let client = Arc::new(ObpClient::new(host.clone()));
+        let label = client.label().to_string();
+        match client.authenticate().await {
             Ok(()) => {
-                tracing::info!("OBP DirectLogin authenticated on host {}", client.active_label());
-                Some(Arc::new(client))
+                tracing::info!("OBP DirectLogin authenticated on host {}", label);
+                if first_authenticated.is_none() {
+                    first_authenticated = Some(client.clone());
+                }
             }
             Err(e) => {
-                tracing::warn!("OBP auth failed: {}. Handshake records will be skipped.", e);
-                None
+                tracing::warn!(
+                    "OBP auth failed for host {}: {}. Will retry on use.",
+                    label, e
+                );
             }
-        },
-        Err(e) => {
-            tracing::warn!("OBP client unavailable: {}. Handshake records will be skipped.", e);
-            None
         }
-    };
+        obp_clients.push(client);
+    }
+    // Single-client view for callers that don't need per-host context
+    // (TCP accept handshake fallback, audio-help post, audio-device diagnostics).
+    // Picks the first host that authenticated; None if none did.
+    let obp_client = first_authenticated;
 
     // NOTE: Entity definitions are no longer created at startup.
     // Agents discover and create them collaboratively during the
@@ -449,21 +461,28 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
         }.instrument(agent_span.clone()));
     }
 
-    // OBP connectivity monitor — plays alert tone when home OBP host is unreachable
-    if let Some(ref obp) = obp_client {
-        let obp = obp.clone();
+    // OBP connectivity monitor — plays alert tone when EVERY OBP host is
+    // unreachable. Silent if at least one host is up.
+    if !obp_clients.is_empty() {
+        let clients = obp_clients.clone();
         let engine_for_monitor = audio_engine.clone();
         tokio::spawn(
-            run_obp_connectivity_monitor(obp, engine_for_monitor)
+            run_obp_connectivity_monitor(clients, engine_for_monitor)
                 .instrument(agent_span.clone()),
         );
     }
 
-    // Signal-channel-based peer discovery (cloud fallback alongside UDP)
-    if let Some(ref obp) = obp_client {
-        let obp = obp.clone();
+    // Signal-channel peer discovery, task-requests, system-commands —
+    // one loop per configured host. Each loop is independent: a failed host
+    // doesn't block the others, and lazy auth retry happens naturally on each
+    // iteration.
+    for client in &obp_clients {
+        let obp = client.clone();
         let mgr = discovery_manager.clone();
         let hs = handshake_done.clone();
+        let mcp = mcp_client.clone();
+        let mcp_diag = mcp_diagnosis.clone();
+        let mood_for_loop = mood.clone();
         tokio::spawn(
             run_signal_discovery_loop(
                 obp,
@@ -473,14 +492,28 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
                 agent_address.clone(),
                 capabilities,
                 hs,
+                mcp,
+                mcp_diag,
+                mood_for_loop,
             )
             .instrument(agent_span.clone()),
         );
     }
 
-    // Poll "task-requests" signal channel for work
-    if let Some(ref obp) = obp_client {
-        let obp = obp.clone();
+    // Per-host inbox loop: accepts incoming signal-channel handshakes
+    // initiated by cross-network peers.
+    for client in &obp_clients {
+        let obp = client.clone();
+        let name = agent_name.clone();
+        let hs = handshake_done.clone();
+        tokio::spawn(
+            run_signal_handshake_inbox_loop(obp, agent_id, name, hs)
+                .instrument(agent_span.clone()),
+        );
+    }
+
+    for client in &obp_clients {
+        let obp = client.clone();
         let name = agent_name.clone();
         let cfg = config.clone();
         let mcp = mcp_client.clone();
@@ -491,8 +524,8 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
 
     // Poll "system-commands" signal channel for direct (non-Claude) ops
     // like wifi-connect and stream-start. See docs/streaming-pi-setup.md.
-    if let Some(ref obp) = obp_client {
-        let obp = obp.clone();
+    for client in &obp_clients {
+        let obp = client.clone();
         let name = agent_name.clone();
         let cfg = config.clone();
         tokio::spawn(async move {
@@ -503,10 +536,7 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
     // Reachability watchdog: force hotspot re-join after prolonged OBP loss.
     // Probes every configured host so failure means *all* hosts are unreachable.
     {
-        let bases: Vec<String> = obp_client
-            .as_ref()
-            .map(|c| c.host_base_urls())
-            .unwrap_or_else(|| config.obp_hosts.iter().map(|h| h.base_url.clone()).collect());
+        let bases: Vec<String> = config.obp_hosts.iter().map(|h| h.base_url.clone()).collect();
         let hotspot = config.hotspot_profile_name.clone();
         let threshold = config.watchdog_fail_threshold;
         let interval = std::time::Duration::from_secs(config.watchdog_probe_interval_secs);
@@ -759,7 +789,8 @@ async fn establish_tcp_channel(
     };
 
     // Channel is now established — run the exploration protocol as initiator
-    let channel = Arc::new(channel);
+    let tcp_arc = Arc::new(channel);
+    let channel = Arc::new(HandshakeChannel::Tcp(tcp_arc));
     run_obp_exploration_initiator(
         channel,
         &agent_name_owned,
@@ -773,30 +804,27 @@ async fn establish_tcp_channel(
 }
 
 // ---------------------------------------------------------------------------
-// Exploration TCP helpers
+// Exploration helpers (work over both TCP and signal-channel transports)
 // ---------------------------------------------------------------------------
 
-/// Send an ExplorationMsg over the TCP channel (spawn_blocking wrapper).
-async fn send_exploration_msg(channel: &Arc<TcpChannel>, msg: &ExplorationMsg) -> Result<()> {
-    let bytes = serde_json::to_vec(msg)?;
-    let ch = channel.clone();
-    tokio::task::spawn_blocking(move || ch.send_message(&bytes)).await??;
-    Ok(())
+/// Send an ExplorationMsg over the handshake channel.
+async fn send_exploration_msg(
+    channel: &Arc<HandshakeChannel>,
+    msg: &ExplorationMsg,
+) -> Result<()> {
+    channel.send(msg).await
 }
 
-/// Receive an ExplorationMsg from the TCP channel (spawn_blocking wrapper).
+/// Receive an ExplorationMsg from the handshake channel.
 /// Returns the raw message including McpDiagnosis.
-async fn recv_exploration_msg(channel: &Arc<TcpChannel>) -> Result<ExplorationMsg> {
-    let ch = channel.clone();
-    let bytes = tokio::task::spawn_blocking(move || ch.recv_message()).await??;
-    let msg: ExplorationMsg = serde_json::from_slice(&bytes)?;
-    Ok(msg)
+async fn recv_exploration_msg(channel: &Arc<HandshakeChannel>) -> Result<ExplorationMsg> {
+    channel.recv().await
 }
 
 /// Receive the next non-diagnostic message, logging any McpDiagnosis
 /// messages that arrive before it. The initiator may inject diagnosis
 /// messages between protocol phases when MCP calls fail.
-async fn recv_draining_diagnoses(channel: &Arc<TcpChannel>) -> Result<ExplorationMsg> {
+async fn recv_draining_diagnoses(channel: &Arc<HandshakeChannel>) -> Result<ExplorationMsg> {
     loop {
         let msg = recv_exploration_msg(channel).await?;
         match msg {
@@ -822,7 +850,7 @@ async fn recv_draining_diagnoses(channel: &Arc<TcpChannel>) -> Result<Exploratio
 /// figure out the creation format, create an entity, discover the
 /// auto-generated CRUD endpoints, and create + verify a test record.
 async fn run_obp_exploration_initiator(
-    channel: Arc<TcpChannel>,
+    channel: Arc<HandshakeChannel>,
     agent_name: &str,
     mcp_client: &Option<Arc<tokio::sync::Mutex<McpClient>>>,
     obp_client: &Option<Arc<ObpClient>>,
@@ -1300,7 +1328,7 @@ async fn run_obp_exploration_initiator(
 /// Acknowledges each phase from the initiator, independently verifies
 /// endpoint discovery, and reads back the test record.
 async fn run_obp_exploration_responder(
-    channel: Arc<TcpChannel>,
+    channel: Arc<HandshakeChannel>,
     agent_name: &str,
     obp_client: &Option<Arc<ObpClient>>,
 ) {
@@ -1747,7 +1775,7 @@ fn find_create_endpoint(content: &str) -> Option<(String, String, String, String
 
 /// Run MCP diagnostics and share the findings with the peer.
 /// Called when an MCP call fails mid-exploration.
-async fn diagnose_and_share_mcp_failure(channel: &Arc<TcpChannel>, error_msg: &str) {
+async fn diagnose_and_share_mcp_failure(channel: &Arc<HandshakeChannel>, error_msg: &str) {
     tracing::info!("Running MCP diagnostics after failure: {}", error_msg);
 
     // Build a config just to read the MCP URL from the environment
@@ -1913,46 +1941,40 @@ async fn read_signal_messages_via_http(
 }
 
 /// Periodically checks reachability of every configured OBP host. Plays a
-/// descending alert tone when the home host is unreachable. Silent when home
-/// is healthy, even if other hosts are down.
+/// descending alert tone when ALL hosts are unreachable. Silent if at least
+/// one host responds.
 async fn run_obp_connectivity_monitor(
-    obp: Arc<ObpClient>,
+    clients: Vec<Arc<ObpClient>>,
     audio_engine: Option<Arc<AudioEngine>>,
 ) {
     const CHECK_INTERVAL_SECS: u64 = 16;
 
-    let host_urls = obp.host_base_urls();
     tracing::info!(
         "OBP connectivity monitor started (checking every {}s, {} host(s), audio_engine={})",
         CHECK_INTERVAL_SECS,
-        host_urls.len(),
+        clients.len(),
         if audio_engine.is_some() { "available" } else { "NONE" }
     );
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(CHECK_INTERVAL_SECS)).await;
 
-        let home_url = obp.base_url().to_string();
-        let home_label = obp.active_label().to_string();
-
-        let mut home_reachable = true;
-        for url in &host_urls {
-            let is_home = *url == home_url;
-            tracing::info!("OBP connectivity check: testing {}{}...",
-                url, if is_home { " (home)" } else { "" });
+        let mut any_reachable = false;
+        for client in &clients {
+            let url = client.base_url();
+            let label = client.label();
+            tracing::info!("OBP connectivity check: testing {} ({})...", label, url);
             match check_obp_reachable(url).await {
-                Ok(()) => tracing::info!("OBP connectivity check: {} reachable", url),
-                Err(e) => {
-                    tracing::warn!("OBP unreachable {}: {}", url, e);
-                    if is_home {
-                        home_reachable = false;
-                    }
+                Ok(()) => {
+                    tracing::info!("OBP connectivity check: {} reachable", label);
+                    any_reachable = true;
                 }
+                Err(e) => tracing::warn!("OBP unreachable {} ({}): {}", label, url, e),
             }
         }
 
-        if !home_reachable {
-            tracing::warn!("Home host '{}' unreachable", home_label);
+        if !any_reachable {
+            tracing::warn!("All OBP hosts unreachable");
             if let Some(ref engine) = audio_engine {
                 tracing::info!("Queuing OBP alert tone via audio engine...");
                 let tone = crate::audio::device::generate_no_obp_tone();
@@ -1979,8 +2001,13 @@ async fn run_signal_discovery_loop(
     agent_address: String,
     capabilities: Capabilities,
     handshake_done: Arc<AtomicBool>,
+    mcp_client: Option<Arc<tokio::sync::Mutex<McpClient>>>,
+    mcp_diagnosis: Option<Vec<String>>,
+    mood: AgentMoodTracker,
 ) {
     use crate::protocol::message::DiscoveryMessage;
+    use std::collections::HashSet;
+    let mut signal_initiated: HashSet<Uuid> = HashSet::new();
 
     // Start signal discovery after a short delay (1 min) — much sooner than
     // UDP (10 min) since it doesn't interfere with audio discovery.
@@ -2065,12 +2092,46 @@ async fn run_signal_discovery_loop(
                             peer_obp_url,
                         );
 
-                        let mut mgr = manager.lock().await;
-                        if mgr.handle_message(&discovery_msg) {
+                        let is_new = {
+                            let mut mgr = manager.lock().await;
+                            mgr.handle_message(&discovery_msg)
+                        };
+                        if is_new {
                             tracing::info!(
                                 "Signal discovery: found peer '{}' ({}@{})",
                                 peer_name, peer_id, peer_address
                             );
+                        }
+
+                        // Initiate signal-channel handshake for cross-network
+                        // peers. If this peer is also LAN-reachable, the TCP
+                        // handshake from UDP discovery will still race ahead
+                        // and `handshake_done` will short-circuit the slower
+                        // signal path.
+                        if !handshake_done.load(Ordering::Acquire)
+                            && !signal_initiated.contains(&peer_id)
+                        {
+                            signal_initiated.insert(peer_id);
+                            let obp_for_hs = obp.clone();
+                            let name = agent_name.clone();
+                            let mcp = mcp_client.clone();
+                            let mcp_diag = mcp_diagnosis.clone();
+                            let mood_for_hs = mood.clone();
+                            let dm = manager.clone();
+                            let hs = handshake_done.clone();
+                            tokio::spawn(async move {
+                                run_signal_handshake_initiator(
+                                    obp_for_hs,
+                                    agent_id,
+                                    peer_id,
+                                    name,
+                                    mcp,
+                                    mcp_diag,
+                                    mood_for_hs,
+                                    dm,
+                                    hs,
+                                ).await;
+                            });
                         }
                     }
                 }
@@ -2087,6 +2148,165 @@ async fn run_signal_discovery_loop(
             ACTIVE_INTERVAL_SECS
         };
         tokio::time::sleep(std::time::Duration::from_secs(interval)).await;
+    }
+}
+
+/// Initiate the exploration protocol over an OBP signal-channel inbox pair.
+/// Used when a peer is discovered via signal channels (cross-network), where
+/// TCP cannot reach them. Records land on whichever OBP host carried the
+/// conversation.
+async fn run_signal_handshake_initiator(
+    obp: Arc<ObpClient>,
+    self_agent_id: Uuid,
+    peer_agent_id: Uuid,
+    agent_name: String,
+    mcp_client: Option<Arc<tokio::sync::Mutex<McpClient>>>,
+    mcp_diagnosis: Option<Vec<String>>,
+    mood: AgentMoodTracker,
+    discovery_manager: Arc<tokio::sync::Mutex<DiscoveryManager>>,
+    handshake_done: Arc<AtomicBool>,
+) {
+    tracing::info!(
+        "Signal handshake initiator: starting with peer {} via host {}",
+        peer_agent_id, obp.label()
+    );
+    let signal_ch = SignalHandshakeChannel::new(obp.clone(), self_agent_id, peer_agent_id);
+    let channel = Arc::new(HandshakeChannel::Signal(signal_ch));
+
+    run_obp_exploration_initiator(
+        channel,
+        &agent_name,
+        &mcp_client,
+        &Some(obp.clone()),
+        &mcp_diagnosis,
+        &mood,
+        &discovery_manager,
+    ).await;
+
+    handshake_done.store(true, Ordering::Release);
+    tracing::info!(
+        "Signal handshake initiator: finished with peer {} on host {}",
+        peer_agent_id, obp.label()
+    );
+}
+
+/// Watch this agent's inbox channel on a single OBP host. Spawns a responder
+/// task whenever a fresh `ExploreStart` arrives from a peer we haven't seen.
+///
+/// Spawned once per `ObpClient` so messages posted to either host's inbox
+/// are picked up. Records land on whichever host the conversation arrived on.
+async fn run_signal_handshake_inbox_loop(
+    obp: Arc<ObpClient>,
+    self_agent_id: Uuid,
+    self_agent_name: String,
+    handshake_done: Arc<AtomicBool>,
+) {
+    use std::collections::HashSet;
+    use std::time::Duration;
+
+    // Settle delay so initial auth has a chance to land
+    tokio::time::sleep(Duration::from_secs(20)).await;
+
+    let inbox = agent_inbox_channel(self_agent_id);
+    let path = format!(
+        "/obp/{}/signal/channels/{}/messages",
+        crate::obp::client::API_VERSION,
+        inbox
+    );
+    let mut seen: HashSet<String> = HashSet::new();
+    let poll_interval = Duration::from_secs(15);
+    let slow_poll_interval = Duration::from_secs(60);
+
+    tracing::info!(
+        "Signal handshake inbox loop started on host {} (channel {})",
+        obp.label(), inbox
+    );
+
+    loop {
+        // Slow polling once we've completed a handshake — but keep watching,
+        // since path 2's `handshake_done` is "first one wins", not "we're done
+        // with everyone forever".
+        let interval = if handshake_done.load(Ordering::Acquire) {
+            slow_poll_interval
+        } else {
+            poll_interval
+        };
+
+        match obp.get(&path).await {
+            Ok(resp) => {
+                if let Some(messages) = resp.get("messages").and_then(|m| m.as_array()) {
+                    for msg in messages {
+                        let payload = match msg.get("payload") {
+                            Some(p) => p,
+                            None => continue,
+                        };
+                        if payload.get("type").and_then(|v| v.as_str()) != Some("handshake") {
+                            continue;
+                        }
+                        let msg_id = match payload.get("msg_id").and_then(|v| v.as_str()) {
+                            Some(id) if !id.is_empty() => id.to_string(),
+                            _ => continue,
+                        };
+                        if seen.contains(&msg_id) {
+                            continue;
+                        }
+                        seen.insert(msg_id.clone());
+
+                        let from_id = match payload
+                            .get("from_agent_id")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| Uuid::parse_str(s).ok())
+                        {
+                            Some(id) if id != self_agent_id => id,
+                            _ => continue,
+                        };
+
+                        let exp_msg: ExplorationMsg = match payload
+                            .get("exploration_msg")
+                            .and_then(|v| serde_json::from_value(v.clone()).ok())
+                        {
+                            Some(m) => m,
+                            None => continue,
+                        };
+
+                        // Only ExploreStart triggers a new responder; later
+                        // protocol phases are handled by an existing responder
+                        // task via its own SignalHandshakeChannel polling.
+                        if !matches!(exp_msg, ExplorationMsg::ExploreStart { .. }) {
+                            continue;
+                        }
+
+                        tracing::info!(
+                            "Signal handshake: incoming ExploreStart from {} on host {}",
+                            from_id, obp.label()
+                        );
+
+                        let signal_ch = SignalHandshakeChannel::new(
+                            obp.clone(),
+                            self_agent_id,
+                            from_id,
+                        );
+                        let channel = Arc::new(HandshakeChannel::Signal(signal_ch));
+                        let name = self_agent_name.clone();
+                        let obp_for_responder = obp.clone();
+                        let hs = handshake_done.clone();
+                        tokio::spawn(async move {
+                            run_obp_exploration_responder(
+                                channel,
+                                &name,
+                                &Some(obp_for_responder),
+                            ).await;
+                            hs.store(true, Ordering::Release);
+                        });
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Inbox poll failed on host {}: {}", obp.label(), e);
+            }
+        }
+
+        tokio::time::sleep(interval).await;
     }
 }
 
@@ -3169,7 +3389,8 @@ async fn handle_tcp_connection(
                     }
 
                     // After hello/hello_ack, run the exploration protocol as responder
-                    let channel = Arc::new(channel);
+                    let tcp_arc = Arc::new(channel);
+                    let channel = Arc::new(HandshakeChannel::Tcp(tcp_arc));
                     run_obp_exploration_responder(
                         channel,
                         &config.agent_name,
