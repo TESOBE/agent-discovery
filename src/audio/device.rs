@@ -458,7 +458,13 @@ pub async fn diagnose_audio_to_signal(config: &Config) -> Result<()> {
     println!("{}", info);
 
     // Post to OBP signal channel
-    let mut obp = crate::obp::client::ObpClient::new(config);
+    let obp = match crate::obp::client::ObpClient::new(config) {
+        Ok(c) => c,
+        Err(e) => {
+            println!("OBP client unavailable (skipping signal post): {}", e);
+            return Ok(());
+        }
+    };
     match obp.authenticate().await {
         Ok(()) => {
             let payload = serde_json::json!({

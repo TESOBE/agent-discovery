@@ -1,15 +1,28 @@
 /// OBP HTTP client with DirectLogin authentication.
 /// Fallback for when MCP server is unavailable.
 ///
+/// Holds a list of OBP hosts (`a`, `b`, ...) and an "active" pointer
+/// indicating which one is currently `home`. Requests go to home; on a
+/// transport failure (connect error / timeout) the client flips home to the
+/// next host and retries. Application errors (4xx / 5xx) do NOT flip home —
+/// the server replied coherently, the host is up.
+///
+/// Auth tokens are stored per host and acquired lazily on first use.
+///
 /// Callers provide the full API path (e.g. `/obp/v6.0.0/management/...`).
-/// The client only prepends the base URL.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use reqwest::Method;
 use serde_json::Value;
+use tokio::sync::RwLock;
 
-use crate::config::Config;
+use crate::config::{Config, ObpHost};
+
+/// The OBP API version used for management and resource-docs endpoints.
+pub const API_VERSION: &str = "v6.0.0";
 
 /// Check if an OBP API base URL is reachable by hitting /obp/v6.0.0/root.
 /// Returns Ok(()) if the endpoint responds with a success status, Err otherwise.
@@ -38,152 +51,103 @@ pub async fn check_obp_reachable(base_url: &str) -> Result<()> {
     }
 }
 
-/// The OBP API version used for management and resource-docs endpoints.
-pub const API_VERSION: &str = "v6.0.0";
-
-/// OBP API client using DirectLogin authentication.
+/// OBP API client: multi-host with sticky-home failover.
 pub struct ObpClient {
-    base_url: String,
-    http_client: reqwest::Client,
-    auth_token: Option<String>,
-    username: String,
-    password: String,
-    consumer_key: String,
+    hosts: Vec<ObpHost>,
+    /// Index into `hosts` of the host currently considered home.
+    active: AtomicUsize,
+    /// Per-host DirectLogin tokens, populated lazily.
+    tokens: Vec<RwLock<Option<String>>>,
+    http: reqwest::Client,
 }
 
 impl ObpClient {
-    pub fn new(config: &Config) -> Self {
-        Self {
-            base_url: config.obp_api_base_url_a.clone(),
-            http_client: reqwest::Client::new(),
-            auth_token: None,
-            username: config.obp_username_a.clone(),
-            password: config.obp_password_a.clone(),
-            consumer_key: config.obp_consumer_key_a.clone(),
+    /// Build a client from the configured OBP hosts. Returns Err if no hosts
+    /// are configured (all entries had empty base URLs).
+    pub fn new(config: &Config) -> Result<Self> {
+        if config.obp_hosts.is_empty() {
+            anyhow::bail!("No OBP hosts configured (set OBP_API_BASE_URL_A and/or _B)");
         }
+        let n = config.obp_hosts.len();
+        Ok(Self {
+            hosts: config.obp_hosts.clone(),
+            active: AtomicUsize::new(0),
+            tokens: (0..n).map(|_| RwLock::new(None)).collect(),
+            http: reqwest::Client::new(),
+        })
     }
 
-    /// Authenticate via DirectLogin and store the token.
-    pub async fn authenticate(&mut self) -> Result<()> {
-        if self.username.is_empty() || self.password.is_empty() || self.consumer_key.is_empty() {
-            anyhow::bail!("OBP credentials not configured (OBP_USERNAME_A, OBP_PASSWORD_A, OBP_CONSUMER_KEY_A)");
-        }
-
-        let auth_header = format!(
-            "DirectLogin username=\"{}\",password=\"{}\",consumer_key=\"{}\"",
-            self.username, self.password, self.consumer_key
-        );
-
-        let url = format!("{}/obp/v6.0.0/my/logins/direct", self.base_url);
-        let response = self
-            .http_client
-            .post(&url)
-            .header("Authorization", &auth_header)
-            .header("Content-Type", "application/json")
-            .send()
-            .await
-            .context("DirectLogin request failed")?;
-
-        let status = response.status();
-        let body: Value = response.json().await.context("Failed to parse DirectLogin response")?;
-
-        if !status.is_success() {
-            anyhow::bail!("DirectLogin failed ({}): {}", status, body);
-        }
-
-        let token = body
-            .get("token")
-            .and_then(|t| t.as_str())
-            .context("No token in DirectLogin response")?
-            .to_string();
-
-        tracing::info!("OBP DirectLogin successful");
-        self.auth_token = Some(token);
-        Ok(())
+    /// Authenticate the current home host eagerly. Other hosts authenticate
+    /// lazily on first use. Returns Err if the home host's auth fails.
+    pub async fn authenticate(&self) -> Result<()> {
+        let idx = self.active.load(Ordering::Acquire);
+        self.ensure_authenticated(idx).await
     }
 
-    /// Make an authenticated GET request. Path should be the full API path
-    /// (e.g. `/obp/v6.0.0/resource-docs/v6.0.0/obp`).
+    /// Base URL of the host currently considered home.
+    pub fn base_url(&self) -> &str {
+        let idx = self.active.load(Ordering::Acquire);
+        &self.hosts[idx].base_url
+    }
+
+    /// Label ("a", "b", ...) of the host currently considered home.
+    pub fn active_label(&self) -> &str {
+        let idx = self.active.load(Ordering::Acquire);
+        &self.hosts[idx].label
+    }
+
+    /// Base URLs of all configured hosts, in priority order.
+    pub fn host_base_urls(&self) -> Vec<String> {
+        self.hosts.iter().map(|h| h.base_url.clone()).collect()
+    }
+
+    /// True if the home host has a cached auth token.
+    pub async fn is_authenticated(&self) -> bool {
+        let idx = self.active.load(Ordering::Acquire);
+        self.tokens[idx].read().await.is_some()
+    }
+
     pub async fn get(&self, path: &str) -> Result<Value> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut request = self.http_client.get(&url);
-
-        if let Some(ref token) = self.auth_token {
-            request = request.header("Authorization", format!("DirectLogin token=\"{}\"", token));
-        }
-
-        let response = request.send().await.context("OBP GET request failed")?;
-        let status = response.status();
-        let body: Value = response.json().await.context("Failed to parse OBP response")?;
-
+        let resp = self.send(Method::GET, path, None).await?;
+        let status = resp.status();
+        let body: Value = resp.json().await.context("Failed to parse OBP response")?;
         if !status.is_success() {
             anyhow::bail!("OBP GET {} failed ({}): {}", path, status, body);
         }
-
         Ok(body)
     }
 
-    /// Make an authenticated POST request. Path should be the full API path
-    /// (e.g. `/obp/v6.0.0/management/system-dynamic-entities`).
     pub async fn post(&self, path: &str, body: &Value) -> Result<Value> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut request = self.http_client.post(&url).json(body);
-
-        if let Some(ref token) = self.auth_token {
-            request = request.header("Authorization", format!("DirectLogin token=\"{}\"", token));
-        }
-
-        let response = request.send().await.context("OBP POST request failed")?;
-        let status = response.status();
-        let response_body: Value = response.json().await.context("Failed to parse OBP response")?;
-
+        let resp = self.send(Method::POST, path, Some(body)).await?;
+        let status = resp.status();
+        let response_body: Value = resp.json().await.context("Failed to parse OBP response")?;
         if !status.is_success() {
             anyhow::bail!("OBP POST {} failed ({}): {}", path, status, response_body);
         }
-
         Ok(response_body)
     }
 
-    /// Make an authenticated PUT request. Path should be the full API path.
     pub async fn put(&self, path: &str, body: &Value) -> Result<Value> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut request = self.http_client.put(&url).json(body);
-
-        if let Some(ref token) = self.auth_token {
-            request = request.header("Authorization", format!("DirectLogin token=\"{}\"", token));
-        }
-
-        let response = request.send().await.context("OBP PUT request failed")?;
-        let status = response.status();
-        let response_body: Value = response.json().await.context("Failed to parse OBP response")?;
-
+        let resp = self.send(Method::PUT, path, Some(body)).await?;
+        let status = resp.status();
+        let response_body: Value = resp.json().await.context("Failed to parse OBP response")?;
         if !status.is_success() {
             anyhow::bail!("OBP PUT {} failed ({}): {}", path, status, response_body);
         }
-
         Ok(response_body)
     }
 
-    /// Make an authenticated DELETE request. Path should be the full API path.
     pub async fn delete(&self, path: &str) -> Result<Value> {
-        let url = format!("{}{}", self.base_url, path);
-        let mut request = self.http_client.delete(&url);
-
-        if let Some(ref token) = self.auth_token {
-            request = request.header("Authorization", format!("DirectLogin token=\"{}\"", token));
-        }
-
-        let response = request.send().await.context("OBP DELETE request failed")?;
-        let status = response.status();
-
+        let resp = self.send(Method::DELETE, path, None).await?;
+        let status = resp.status();
         if status.is_success() {
-            // Some DELETE responses may be empty
-            match response.json().await {
+            // DELETE may return an empty body
+            match resp.json().await {
                 Ok(body) => Ok(body),
                 Err(_) => Ok(Value::Null),
             }
         } else {
-            let body: Value = response
+            let body: Value = resp
                 .json()
                 .await
                 .unwrap_or(Value::String("Unknown error".into()));
@@ -191,11 +155,170 @@ impl ObpClient {
         }
     }
 
-    pub fn is_authenticated(&self) -> bool {
-        self.auth_token.is_some()
+    /// Send a request to the home host, with sticky failover to the next host
+    /// on transport failure. Returns the raw response (caller checks status).
+    async fn send(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<reqwest::Response> {
+        let n = self.hosts.len();
+        let mut last_err: Option<anyhow::Error> = None;
+
+        for _ in 0..n {
+            let idx = self.active.load(Ordering::Acquire);
+            let host = &self.hosts[idx];
+
+            // Lazy auth. If auth itself fails on a transport error, treat as
+            // a host failure and flip home; otherwise surface the error.
+            if let Err(e) = self.ensure_authenticated(idx).await {
+                if is_transport_anyhow(&e) {
+                    tracing::warn!(
+                        "OBP auth transport failure on host {}: {}",
+                        host.label,
+                        e
+                    );
+                    self.flip_home_from(idx);
+                    last_err = Some(e);
+                    continue;
+                }
+                return Err(e);
+            }
+
+            let token = self.tokens[idx].read().await.clone();
+            let url = format!("{}{}", host.base_url, path);
+
+            let mut req = self.http.request(method.clone(), &url);
+            if let Some(t) = &token {
+                req = req.header("Authorization", format!("DirectLogin token=\"{}\"", t));
+            }
+            if let Some(b) = body {
+                req = req.json(b);
+            }
+
+            match req.send().await {
+                Ok(resp) => return Ok(resp),
+                Err(e) if is_transport_failure(&e) => {
+                    tracing::warn!(
+                        "OBP transport failure on host {} ({}): {}",
+                        host.label,
+                        url,
+                        e
+                    );
+                    self.flip_home_from(idx);
+                    last_err = Some(anyhow::anyhow!(
+                        "transport failure on host {}: {}",
+                        host.label,
+                        e
+                    ));
+                    continue;
+                }
+                Err(e) => return Err(anyhow::anyhow!("OBP request failed: {}", e)),
+            }
+        }
+
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all OBP hosts failed for {}", path)))
     }
 
-    pub fn base_url(&self) -> &str {
-        &self.base_url
+    /// Authenticate host `idx` if not already authenticated. Idempotent and
+    /// safe under concurrent calls (double-checked locking).
+    async fn ensure_authenticated(&self, idx: usize) -> Result<()> {
+        {
+            let token = self.tokens[idx].read().await;
+            if token.is_some() {
+                return Ok(());
+            }
+        }
+
+        let mut token = self.tokens[idx].write().await;
+        if token.is_some() {
+            return Ok(());
+        }
+
+        let host = &self.hosts[idx];
+        if host.username.is_empty() || host.password.is_empty() || host.consumer_key.is_empty() {
+            anyhow::bail!(
+                "OBP credentials not configured for host {} (OBP_USERNAME_{}, OBP_PASSWORD_{}, OBP_CONSUMER_KEY_{})",
+                host.label,
+                host.label.to_uppercase(),
+                host.label.to_uppercase(),
+                host.label.to_uppercase(),
+            );
+        }
+
+        let auth_header = format!(
+            "DirectLogin username=\"{}\",password=\"{}\",consumer_key=\"{}\"",
+            host.username, host.password, host.consumer_key
+        );
+
+        let url = format!("{}/obp/{}/my/logins/direct", host.base_url, API_VERSION);
+        let response = self
+            .http
+            .post(&url)
+            .header("Authorization", &auth_header)
+            .header("Content-Type", "application/json")
+            .send()
+            .await
+            .with_context(|| format!("DirectLogin request failed for host {}", host.label))?;
+
+        let status = response.status();
+        let body: Value = response
+            .json()
+            .await
+            .context("Failed to parse DirectLogin response")?;
+
+        if !status.is_success() {
+            anyhow::bail!(
+                "DirectLogin failed for host {} ({}): {}",
+                host.label,
+                status,
+                body
+            );
+        }
+
+        let token_str = body
+            .get("token")
+            .and_then(|t| t.as_str())
+            .context("No token in DirectLogin response")?
+            .to_string();
+
+        tracing::info!("OBP DirectLogin successful for host {}", host.label);
+        *token = Some(token_str);
+        Ok(())
     }
+
+    /// Advance `active` from `observed_idx` to the next host. CAS so that
+    /// concurrent failures only flip home once per failure event.
+    fn flip_home_from(&self, observed_idx: usize) {
+        let n = self.hosts.len();
+        if n < 2 {
+            return;
+        }
+        let next = (observed_idx + 1) % n;
+        let from = self.hosts[observed_idx].label.clone();
+        let to = self.hosts[next].label.clone();
+        if self
+            .active
+            .compare_exchange(observed_idx, next, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            tracing::warn!("OBP home: {} → {}", from, to);
+        }
+    }
+}
+
+/// True if the reqwest error indicates the host is unreachable
+/// (connect refused, DNS failure, timeout) rather than the host replying
+/// with an unexpected payload or status.
+fn is_transport_failure(err: &reqwest::Error) -> bool {
+    err.is_connect() || err.is_timeout() || err.is_request()
+}
+
+/// Best-effort check for whether an anyhow error wraps a transport-level
+/// reqwest error. Used only for the lazy-auth path inside `send`.
+fn is_transport_anyhow(err: &anyhow::Error) -> bool {
+    err.chain()
+        .filter_map(|e| e.downcast_ref::<reqwest::Error>())
+        .any(is_transport_failure)
 }

@@ -1,22 +1,26 @@
 use anyhow::{Context, Result};
 
+/// One OBP host the agent can talk to. Read from env vars suffixed by `label`
+/// uppercased (e.g. label "a" → OBP_API_BASE_URL_A, OBP_USERNAME_A, ...).
+#[derive(Debug, Clone)]
+pub struct ObpHost {
+    pub label: String,
+    pub base_url: String,
+    pub username: String,
+    pub password: String,
+    pub consumer_key: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub agent_name: String,
     pub agent_listen_port: u16,
     pub claude_api_key: String,
     pub claude_model: String,
-    /// Primary OBP instance (typically the local / self-hosted one).
-    pub obp_api_base_url_a: String,
-    pub obp_username_a: String,
-    pub obp_password_a: String,
-    pub obp_consumer_key_a: String,
-    /// Secondary OBP instance (typically apisandbox.openbankproject.com).
-    /// Loaded from env; not yet wired into runtime — federation comes later.
-    pub obp_api_base_url_b: String,
-    pub obp_username_b: String,
-    pub obp_password_b: String,
-    pub obp_consumer_key_b: String,
+    /// OBP hosts in priority order. The agent starts on `obp_hosts[0]` (home)
+    /// and switches to the next host on transport failure. Hosts with an
+    /// empty base URL in the env are filtered out.
+    pub obp_hosts: Vec<ObpHost>,
     /// URL of a running MCP server (streamable HTTP transport).
     pub obp_mcp_server_url: Option<String>,
     /// Directory for log files. Defaults to /tmp/agent-discovery.
@@ -46,6 +50,28 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         dotenvy::dotenv().ok();
 
+        let obp_hosts = ["a", "b"]
+            .into_iter()
+            .filter_map(|label| {
+                let upper = label.to_uppercase();
+                let base_url = std::env::var(format!("OBP_API_BASE_URL_{}", upper))
+                    .unwrap_or_default();
+                if base_url.is_empty() {
+                    return None;
+                }
+                Some(ObpHost {
+                    label: label.into(),
+                    base_url,
+                    username: std::env::var(format!("OBP_USERNAME_{}", upper))
+                        .unwrap_or_default(),
+                    password: std::env::var(format!("OBP_PASSWORD_{}", upper))
+                        .unwrap_or_default(),
+                    consumer_key: std::env::var(format!("OBP_CONSUMER_KEY_{}", upper))
+                        .unwrap_or_default(),
+                })
+            })
+            .collect();
+
         Ok(Self {
             agent_name: std::env::var("AGENT_NAME")
                 .unwrap_or_else(|_| "agent-default".into()),
@@ -57,14 +83,7 @@ impl Config {
                 .unwrap_or_default(),
             claude_model: std::env::var("CLAUDE_MODEL")
                 .unwrap_or_else(|_| "claude-sonnet-4-20250514".into()),
-            obp_api_base_url_a: std::env::var("OBP_API_BASE_URL_A").unwrap_or_default(),
-            obp_username_a: std::env::var("OBP_USERNAME_A").unwrap_or_default(),
-            obp_password_a: std::env::var("OBP_PASSWORD_A").unwrap_or_default(),
-            obp_consumer_key_a: std::env::var("OBP_CONSUMER_KEY_A").unwrap_or_default(),
-            obp_api_base_url_b: std::env::var("OBP_API_BASE_URL_B").unwrap_or_default(),
-            obp_username_b: std::env::var("OBP_USERNAME_B").unwrap_or_default(),
-            obp_password_b: std::env::var("OBP_PASSWORD_B").unwrap_or_default(),
-            obp_consumer_key_b: std::env::var("OBP_CONSUMER_KEY_B").unwrap_or_default(),
+            obp_hosts,
             obp_mcp_server_url: Some(std::env::var("OBP_MCP_SERVER_URL")
                 .unwrap_or_else(|_| "http://0.0.0.0:9100/mcp".into())),
             log_dir: std::env::var("LOG_DIR")

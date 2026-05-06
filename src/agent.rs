@@ -165,7 +165,7 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
     if !config.claude_api_key.is_empty() {
         capabilities = capabilities.with_claude();
     }
-    if !config.obp_username_a.is_empty() {
+    if config.obp_hosts.iter().any(|h| !h.username.is_empty()) {
         capabilities = capabilities.with_obp();
     }
 
@@ -189,17 +189,20 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
 
     // Set up OBP client for direct HTTP calls (entity record creation)
     eprintln!("[early] setting up OBP client...");
-    let obp_client = {
-        let mut client = ObpClient::new(&config);
-        match client.authenticate().await {
+    let obp_client = match ObpClient::new(&config) {
+        Ok(client) => match client.authenticate().await {
             Ok(()) => {
-                tracing::info!("OBP DirectLogin authenticated");
+                tracing::info!("OBP DirectLogin authenticated on host {}", client.active_label());
                 Some(Arc::new(client))
             }
             Err(e) => {
                 tracing::warn!("OBP auth failed: {}. Handshake records will be skipped.", e);
                 None
             }
+        },
+        Err(e) => {
+            tracing::warn!("OBP client unavailable: {}. Handshake records will be skipped.", e);
+            None
         }
     };
 
@@ -229,7 +232,7 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
         agent_address: agent_address.clone(),
         capabilities,
         tx_band,
-        obp_api_base_url: config.obp_api_base_url_a.clone(),
+        obp_api_base_url: config.obp_hosts.first().map(|h| h.base_url.clone()).unwrap_or_default(),
         ..Default::default()
     };
 
@@ -446,11 +449,12 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
         }.instrument(agent_span.clone()));
     }
 
-    // OBP connectivity monitor — plays alert tone when OBP is unreachable
-    if !config.obp_api_base_url_a.is_empty() {
+    // OBP connectivity monitor — plays alert tone when home OBP host is unreachable
+    if let Some(ref obp) = obp_client {
+        let obp = obp.clone();
         let engine_for_monitor = audio_engine.clone();
         tokio::spawn(
-            run_obp_connectivity_monitor(config.obp_api_base_url_a.clone(), engine_for_monitor)
+            run_obp_connectivity_monitor(obp, engine_for_monitor)
                 .instrument(agent_span.clone()),
         );
     }
@@ -468,7 +472,6 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
                 agent_name.clone(),
                 agent_address.clone(),
                 capabilities,
-                config.obp_api_base_url_a.clone(),
                 hs,
             )
             .instrument(agent_span.clone()),
@@ -497,15 +500,16 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
         }.instrument(agent_span.clone()));
     }
 
-    // Reachability watchdog: force hotspot re-join after prolonged OBP loss
+    // Reachability watchdog: force hotspot re-join after prolonged OBP loss.
+    // Probes every configured host so failure means *all* hosts are unreachable.
     {
-        let base = config.obp_api_base_url_a.clone();
+        let bases: Vec<String> = config.obp_hosts.iter().map(|h| h.base_url.clone()).collect();
         let hotspot = config.hotspot_profile_name.clone();
         let threshold = config.watchdog_fail_threshold;
         let interval = std::time::Duration::from_secs(config.watchdog_probe_interval_secs);
         tokio::spawn(async move {
             crate::system_commands::watchdog::run_reachability_watchdog(
-                base, hotspot, threshold, interval,
+                bases, hotspot, threshold, interval,
             ).await;
         }.instrument(agent_span.clone()));
     }
@@ -1905,42 +1909,56 @@ async fn read_signal_messages_via_http(
     Ok(response)
 }
 
-/// Cloud-based peer discovery via OBP signal channels.
-///
-/// Periodically checks OBP reachability and plays a descending alert tone
-/// when the API is unreachable. Silent when healthy.
+/// Periodically checks reachability of every configured OBP host. Plays a
+/// descending alert tone when the home host is unreachable. Silent when home
+/// is healthy, even if other hosts are down.
 async fn run_obp_connectivity_monitor(
-    obp_api_base_url: String,
+    obp: Arc<ObpClient>,
     audio_engine: Option<Arc<AudioEngine>>,
 ) {
     const CHECK_INTERVAL_SECS: u64 = 16;
 
+    let host_urls = obp.host_base_urls();
     tracing::info!(
-        "OBP connectivity monitor started (checking every {}s, audio_engine={})",
+        "OBP connectivity monitor started (checking every {}s, {} host(s), audio_engine={})",
         CHECK_INTERVAL_SECS,
+        host_urls.len(),
         if audio_engine.is_some() { "available" } else { "NONE" }
     );
 
     loop {
         tokio::time::sleep(std::time::Duration::from_secs(CHECK_INTERVAL_SECS)).await;
 
-        tracing::info!("OBP connectivity check: testing {}...", obp_api_base_url);
-        match check_obp_reachable(&obp_api_base_url).await {
-            Ok(()) => {
-                tracing::info!("OBP connectivity check: reachable");
-            }
-            Err(e) => {
-                tracing::warn!("OBP unreachable: {}", e);
-                if let Some(ref engine) = audio_engine {
-                    tracing::info!("Queuing OBP alert tone via audio engine...");
-                    let tone = crate::audio::device::generate_no_obp_tone();
-                    match engine.send_samples(tone) {
-                        Ok(()) => tracing::info!("OBP alert tone queued OK"),
-                        Err(tone_err) => tracing::warn!("Failed to play OBP alert tone: {}", tone_err),
+        let home_url = obp.base_url().to_string();
+        let home_label = obp.active_label().to_string();
+
+        let mut home_reachable = true;
+        for url in &host_urls {
+            let is_home = *url == home_url;
+            tracing::info!("OBP connectivity check: testing {}{}...",
+                url, if is_home { " (home)" } else { "" });
+            match check_obp_reachable(url).await {
+                Ok(()) => tracing::info!("OBP connectivity check: {} reachable", url),
+                Err(e) => {
+                    tracing::warn!("OBP unreachable {}: {}", url, e);
+                    if is_home {
+                        home_reachable = false;
                     }
-                } else {
-                    tracing::warn!("No audio engine available — cannot play OBP alert tone");
                 }
+            }
+        }
+
+        if !home_reachable {
+            tracing::warn!("Home host '{}' unreachable", home_label);
+            if let Some(ref engine) = audio_engine {
+                tracing::info!("Queuing OBP alert tone via audio engine...");
+                let tone = crate::audio::device::generate_no_obp_tone();
+                match engine.send_samples(tone) {
+                    Ok(()) => tracing::info!("OBP alert tone queued OK"),
+                    Err(tone_err) => tracing::warn!("Failed to play OBP alert tone: {}", tone_err),
+                }
+            } else {
+                tracing::warn!("No audio engine available — cannot play OBP alert tone");
             }
         }
     }
@@ -1957,7 +1975,6 @@ async fn run_signal_discovery_loop(
     agent_name: String,
     agent_address: String,
     capabilities: Capabilities,
-    obp_api_base_url: String,
     handshake_done: Arc<AtomicBool>,
 ) {
     use crate::protocol::message::DiscoveryMessage;
@@ -1979,13 +1996,15 @@ async fn run_signal_discovery_loop(
 
     loop {
         // --- Publish own presence ---
+        // The advertised OBP URL tracks home, so peers learn where to reach us
+        // *now*. Stale on flip but corrected on the next tick.
         let payload = serde_json::json!({
             "payload": {
                 "from": agent_name,
                 "agent_id": agent_id.to_string(),
                 "address": agent_address,
                 "capabilities": capabilities.0 as u32,
-                "obp_api_base_url": obp_api_base_url,
+                "obp_api_base_url": obp.base_url(),
                 "type": "agent-presence",
                 "timestamp": crate::obp::entities::iso_now(),
             }
