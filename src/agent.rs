@@ -2441,6 +2441,20 @@ fn isolation_multiplier(now_secs: u64, last_hello_heard_secs: u64) -> f32 {
     }
 }
 
+/// Hello cadence (minutes between transmissions) for an agent that hasn't yet
+/// heard any peer. Backs off as loneliness grows so we don't chirp forever
+/// every minute when nothing is around. A newly-arriving peer will also be
+/// chirping aggressively at startup, so we'll hear them and reset.
+fn lonely_backoff_minutes(elapsed_alone_min: u64) -> u64 {
+    match elapsed_alone_min {
+        0..=4 => 1,
+        5..=14 => 5,
+        15..=29 => 15,
+        30..=59 => 30,
+        _ => 60,
+    }
+}
+
 /// Derive a fixed second from an agent name using FNV-1a hash.
 /// Returns one of 0, 10, 20, 30, 40, 50 — giving 6 slots per minute,
 /// each 10 seconds apart, so agents never transmit at the same time.
@@ -2466,8 +2480,11 @@ fn hello_second_from_name(name: &str) -> u32 {
 ///
 /// Timing: each agent is assigned a fixed second within the minute (derived
 /// from its name) so that agents never transmit at the same time. Before
-/// contact, the agent transmits every minute at that second. After contact,
-/// it slows to every 10 minutes. After a TCP handshake, every 40 minutes.
+/// any peer is heard, the cadence backs off with loneliness — every 1 min
+/// for the first 5 min, then 5, 15, 30, and finally 60 min once an hour
+/// has passed without hearing anyone (see `lonely_backoff_minutes`). After
+/// contact, it switches to every 10 minutes. After a TCP handshake, every
+/// 40 minutes.
 async fn run_announce_loop(
     manager: Arc<tokio::sync::Mutex<DiscoveryManager>>,
     engine: Arc<AudioEngine>,
@@ -2498,6 +2515,10 @@ async fn run_announce_loop(
     let mut minutes_between_hellos: u64 = 1; // every minute initially
     let mut made_contact = false;
     let mut url_chunk_index: usize = 0;
+    let startup_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
 
     loop {
         // Wait until our designated second within the minute
@@ -2505,6 +2526,27 @@ async fn run_announce_loop(
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+
+        // Pre-contact loneliness backoff: if we've never heard a peer, slow
+        // down based on how long we've been alone. After the first peer is
+        // heard, `made_contact` is set and the post-contact cadence (10 min,
+        // or 40 min after handshake) takes over.
+        if !made_contact {
+            let last_heard = last_hello_heard_secs.load(Ordering::Acquire);
+            let reference = if last_heard == 0 { startup_secs } else { last_heard };
+            let elapsed_alone_min = now_secs.saturating_sub(reference) / 60;
+            let new_interval = lonely_backoff_minutes(elapsed_alone_min);
+            if new_interval != minutes_between_hellos {
+                tracing::info!(
+                    elapsed_alone_min,
+                    new_interval,
+                    "TX: No peers heard for {} min, hello cadence now every {} min",
+                    elapsed_alone_min, new_interval
+                );
+                minutes_between_hellos = new_interval;
+            }
+        }
+
         let current_second = (now_secs % 60) as u32;
         let wait_secs = if current_second <= my_second {
             my_second - current_second
