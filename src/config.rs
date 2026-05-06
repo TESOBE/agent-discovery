@@ -61,7 +61,7 @@ impl Config {
                 }
                 Some(ObpHost {
                     label: label.into(),
-                    base_url,
+                    base_url: base_url.trim_end_matches('/').to_string(),
                     username: std::env::var(format!("OBP_USERNAME_{}", upper))
                         .unwrap_or_default(),
                     password: std::env::var(format!("OBP_PASSWORD_{}", upper))

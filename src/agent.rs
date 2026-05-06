@@ -503,7 +503,10 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
     // Reachability watchdog: force hotspot re-join after prolonged OBP loss.
     // Probes every configured host so failure means *all* hosts are unreachable.
     {
-        let bases: Vec<String> = config.obp_hosts.iter().map(|h| h.base_url.clone()).collect();
+        let bases: Vec<String> = obp_client
+            .as_ref()
+            .map(|c| c.host_base_urls())
+            .unwrap_or_else(|| config.obp_hosts.iter().map(|h| h.base_url.clone()).collect());
         let hotspot = config.hotspot_profile_name.clone();
         let threshold = config.watchdog_fail_threshold;
         let interval = std::time::Duration::from_secs(config.watchdog_probe_interval_secs);
@@ -1996,8 +1999,8 @@ async fn run_signal_discovery_loop(
 
     loop {
         // --- Publish own presence ---
-        // The advertised OBP URL tracks home, so peers learn where to reach us
-        // *now*. Stale on flip but corrected on the next tick.
+        // The advertised OBP URL reflects home at publish time; peers will see
+        // the new URL after the next publish round if home flips.
         let payload = serde_json::json!({
             "payload": {
                 "from": agent_name,

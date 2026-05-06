@@ -3,8 +3,9 @@
 ///
 /// Holds a list of OBP hosts (`a`, `b`, ...) and an "active" pointer
 /// indicating which one is currently `home`. Requests go to home; on a
-/// transport failure (connect error / timeout) the client flips home to the
-/// next host and retries. Application errors (4xx / 5xx) do NOT flip home —
+/// transport failure (connect error / timeout) or an auth failure, the client
+/// flips home to the next host and retries. Application errors from a
+/// successful HTTP exchange (4xx / 5xx on the data path) do NOT flip home —
 /// the server replied coherently, the host is up.
 ///
 /// Auth tokens are stored per host and acquired lazily on first use.
@@ -15,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use reqwest::Method;
+use reqwest::{Method, StatusCode};
 use serde_json::Value;
 use tokio::sync::RwLock;
 
@@ -51,13 +52,18 @@ pub async fn check_obp_reachable(base_url: &str) -> Result<()> {
     }
 }
 
+/// One configured host plus its lazily-acquired auth token.
+struct HostState {
+    host: ObpHost,
+    token: RwLock<Option<String>>,
+}
+
 /// OBP API client: multi-host with sticky-home failover.
 pub struct ObpClient {
-    hosts: Vec<ObpHost>,
+    /// Hosts in priority order, each carrying its own lazy auth token.
+    hosts: Vec<HostState>,
     /// Index into `hosts` of the host currently considered home.
     active: AtomicUsize,
-    /// Per-host DirectLogin tokens, populated lazily.
-    tokens: Vec<RwLock<Option<String>>>,
     http: reqwest::Client,
 }
 
@@ -68,73 +74,79 @@ impl ObpClient {
         if config.obp_hosts.is_empty() {
             anyhow::bail!("No OBP hosts configured (set OBP_API_BASE_URL_A and/or _B)");
         }
-        let n = config.obp_hosts.len();
+        let hosts = config
+            .obp_hosts
+            .iter()
+            .map(|h| HostState {
+                host: h.clone(),
+                token: RwLock::new(None),
+            })
+            .collect();
         Ok(Self {
-            hosts: config.obp_hosts.clone(),
+            hosts,
             active: AtomicUsize::new(0),
-            tokens: (0..n).map(|_| RwLock::new(None)).collect(),
             http: reqwest::Client::new(),
         })
     }
 
-    /// Authenticate the current home host eagerly. Other hosts authenticate
-    /// lazily on first use. Returns Err if the home host's auth fails.
+    /// Authenticate at startup by walking the host list. Returns Ok as soon
+    /// as any host successfully authenticates; that host becomes home. Any
+    /// failure flips home to the next candidate. Returns Err only if every
+    /// host failed.
     pub async fn authenticate(&self) -> Result<()> {
-        let idx = self.active.load(Ordering::Acquire);
-        self.ensure_authenticated(idx).await
+        let n = self.hosts.len();
+        let mut last_err: Option<anyhow::Error> = None;
+        for _ in 0..n {
+            let idx = self.active.load(Ordering::Acquire);
+            let label = self.hosts[idx].host.label.clone();
+            match self.ensure_authenticated(idx).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    tracing::warn!("OBP auth failed for host {}: {}", label, e);
+                    self.flip_home_from(idx);
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("all OBP hosts failed auth")))
     }
 
     /// Base URL of the host currently considered home.
     pub fn base_url(&self) -> &str {
         let idx = self.active.load(Ordering::Acquire);
-        &self.hosts[idx].base_url
+        &self.hosts[idx].host.base_url
     }
 
     /// Label ("a", "b", ...) of the host currently considered home.
     pub fn active_label(&self) -> &str {
         let idx = self.active.load(Ordering::Acquire);
-        &self.hosts[idx].label
+        &self.hosts[idx].host.label
     }
 
     /// Base URLs of all configured hosts, in priority order.
     pub fn host_base_urls(&self) -> Vec<String> {
-        self.hosts.iter().map(|h| h.base_url.clone()).collect()
+        self.hosts.iter().map(|h| h.host.base_url.clone()).collect()
     }
 
     /// True if the home host has a cached auth token.
     pub async fn is_authenticated(&self) -> bool {
         let idx = self.active.load(Ordering::Acquire);
-        self.tokens[idx].read().await.is_some()
+        self.hosts[idx].token.read().await.is_some()
     }
 
     pub async fn get(&self, path: &str) -> Result<Value> {
         let resp = self.send(Method::GET, path, None).await?;
-        let status = resp.status();
-        let body: Value = resp.json().await.context("Failed to parse OBP response")?;
-        if !status.is_success() {
-            anyhow::bail!("OBP GET {} failed ({}): {}", path, status, body);
-        }
-        Ok(body)
+        parse_response("GET", path, resp).await
     }
 
     pub async fn post(&self, path: &str, body: &Value) -> Result<Value> {
         let resp = self.send(Method::POST, path, Some(body)).await?;
-        let status = resp.status();
-        let response_body: Value = resp.json().await.context("Failed to parse OBP response")?;
-        if !status.is_success() {
-            anyhow::bail!("OBP POST {} failed ({}): {}", path, status, response_body);
-        }
-        Ok(response_body)
+        parse_response("POST", path, resp).await
     }
 
     pub async fn put(&self, path: &str, body: &Value) -> Result<Value> {
         let resp = self.send(Method::PUT, path, Some(body)).await?;
-        let status = resp.status();
-        let response_body: Value = resp.json().await.context("Failed to parse OBP response")?;
-        if !status.is_success() {
-            anyhow::bail!("OBP PUT {} failed ({}): {}", path, status, response_body);
-        }
-        Ok(response_body)
+        parse_response("PUT", path, resp).await
     }
 
     pub async fn delete(&self, path: &str) -> Result<Value> {
@@ -156,7 +168,8 @@ impl ObpClient {
     }
 
     /// Send a request to the home host, with sticky failover to the next host
-    /// on transport failure. Returns the raw response (caller checks status).
+    /// on transport or auth failure. Returns the raw response (caller checks
+    /// status for application-level errors).
     async fn send(
         &self,
         method: Method,
@@ -168,25 +181,18 @@ impl ObpClient {
 
         for _ in 0..n {
             let idx = self.active.load(Ordering::Acquire);
-            let host = &self.hosts[idx];
+            let host = &self.hosts[idx].host;
 
-            // Lazy auth. If auth itself fails on a transport error, treat as
-            // a host failure and flip home; otherwise surface the error.
+            // Auth precondition: any failure here (transport or HTTP) flips
+            // home — we can't use this host without a token, so move on.
             if let Err(e) = self.ensure_authenticated(idx).await {
-                if is_transport_anyhow(&e) {
-                    tracing::warn!(
-                        "OBP auth transport failure on host {}: {}",
-                        host.label,
-                        e
-                    );
-                    self.flip_home_from(idx);
-                    last_err = Some(e);
-                    continue;
-                }
-                return Err(e);
+                tracing::warn!("OBP auth failed on host {}: {}", host.label, e);
+                self.flip_home_from(idx);
+                last_err = Some(e);
+                continue;
             }
 
-            let token = self.tokens[idx].read().await.clone();
+            let token = self.hosts[idx].token.read().await.clone();
             let url = format!("{}{}", host.base_url, path);
 
             let mut req = self.http.request(method.clone(), &url);
@@ -225,18 +231,18 @@ impl ObpClient {
     /// safe under concurrent calls (double-checked locking).
     async fn ensure_authenticated(&self, idx: usize) -> Result<()> {
         {
-            let token = self.tokens[idx].read().await;
+            let token = self.hosts[idx].token.read().await;
             if token.is_some() {
                 return Ok(());
             }
         }
 
-        let mut token = self.tokens[idx].write().await;
+        let mut token = self.hosts[idx].token.write().await;
         if token.is_some() {
             return Ok(());
         }
 
-        let host = &self.hosts[idx];
+        let host = &self.hosts[idx].host;
         if host.username.is_empty() || host.password.is_empty() || host.consumer_key.is_empty() {
             anyhow::bail!(
                 "OBP credentials not configured for host {} (OBP_USERNAME_{}, OBP_PASSWORD_{}, OBP_CONSUMER_KEY_{})",
@@ -296,8 +302,8 @@ impl ObpClient {
             return;
         }
         let next = (observed_idx + 1) % n;
-        let from = self.hosts[observed_idx].label.clone();
-        let to = self.hosts[next].label.clone();
+        let from = self.hosts[observed_idx].host.label.clone();
+        let to = self.hosts[next].host.label.clone();
         if self
             .active
             .compare_exchange(observed_idx, next, Ordering::AcqRel, Ordering::Acquire)
@@ -308,17 +314,19 @@ impl ObpClient {
     }
 }
 
+/// Parse a JSON response and surface non-success statuses as anyhow errors.
+async fn parse_response(method: &str, path: &str, resp: reqwest::Response) -> Result<Value> {
+    let status: StatusCode = resp.status();
+    let body: Value = resp.json().await.context("Failed to parse OBP response")?;
+    if !status.is_success() {
+        anyhow::bail!("OBP {} {} failed ({}): {}", method, path, status, body);
+    }
+    Ok(body)
+}
+
 /// True if the reqwest error indicates the host is unreachable
 /// (connect refused, DNS failure, timeout) rather than the host replying
 /// with an unexpected payload or status.
 fn is_transport_failure(err: &reqwest::Error) -> bool {
-    err.is_connect() || err.is_timeout() || err.is_request()
-}
-
-/// Best-effort check for whether an anyhow error wraps a transport-level
-/// reqwest error. Used only for the lazy-auth path inside `send`.
-fn is_transport_anyhow(err: &anyhow::Error) -> bool {
-    err.chain()
-        .filter_map(|e| e.downcast_ref::<reqwest::Error>())
-        .any(is_transport_failure)
+    err.is_connect() || err.is_timeout()
 }
