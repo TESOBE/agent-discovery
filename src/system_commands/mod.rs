@@ -182,6 +182,56 @@ async fn dispatch(cmd: SystemCommand, config: &Config) -> Result<Value> {
     }
 }
 
+/// Periodically publish the stream service's active state to the
+/// `stream-status` signal channel. Uses `systemctl is-active` (read-only,
+/// no polkit). One task per OBP host.
+pub async fn run_stream_status_publisher(
+    obp: Arc<ObpClient>,
+    config: Config,
+    agent_name: String,
+) {
+    let channel = "stream-status";
+    let interval = Duration::from_secs(config.stream_status_interval_secs);
+
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    tracing::info!(
+        "stream-status publisher: posting to '{}' every {}s",
+        channel,
+        config.stream_status_interval_secs,
+    );
+
+    loop {
+        let status_result = stream::status(&config.stream_service_name).await;
+        let payload = match status_result {
+            Ok(v) => json!({
+                "payload": {
+                    "type": "stream-status",
+                    "from": agent_name,
+                    "service": config.stream_service_name,
+                    "active": v.get("active").and_then(|a| a.as_bool()).unwrap_or(false),
+                    "timestamp": iso_now(),
+                }
+            }),
+            Err(e) => json!({
+                "payload": {
+                    "type": "stream-status",
+                    "from": agent_name,
+                    "service": config.stream_service_name,
+                    "error": e.to_string(),
+                    "timestamp": iso_now(),
+                }
+            }),
+        };
+
+        if let Err(e) = publish_signal(&obp, channel, &payload).await {
+            tracing::debug!("stream-status publisher: publish failed: {}", e);
+        }
+
+        tokio::time::sleep(interval).await;
+    }
+}
+
 async fn publish_signal(obp: &ObpClient, channel: &str, payload: &Value) -> Result<Value> {
     let path = format!("/obp/{}/signal/channels/{}/messages", API_VERSION, channel);
     obp.post(&path, payload)

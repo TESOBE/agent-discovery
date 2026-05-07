@@ -533,14 +533,13 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
         }.instrument(agent_span.clone()));
     }
 
-    // Auto-start the ffmpeg stream service on boot (opt-out via AUTO_START_STREAM=false).
-    if config.auto_start_stream {
-        let service = config.stream_service_name.clone();
+    // Publish stream service state to the "stream-status" signal channel.
+    for client in &obp_clients {
+        let obp = client.clone();
+        let name = agent_name.clone();
+        let cfg = config.clone();
         tokio::spawn(async move {
-            match crate::system_commands::stream::start(&service).await {
-                Ok(v) => tracing::info!(service = %service, result = %v, "Auto-started stream service"),
-                Err(e) => tracing::warn!(service = %service, error = %e, "Auto-start of stream service failed"),
-            }
+            crate::system_commands::run_stream_status_publisher(obp, cfg, name).await;
         }.instrument(agent_span.clone()));
     }
 
