@@ -203,6 +203,24 @@ pub async fn run_stream_status_publisher(
 
     loop {
         let status_result = stream::status(&config.stream_service_name).await;
+        let rtmp_url = stream::read_rtmp_url().await;
+        let progress = stream::read_recent_progress(&config.stream_service_name).await;
+
+        let progress_json = progress.as_ref().and_then(|p| {
+            if p.is_empty() {
+                None
+            } else {
+                Some(json!({
+                    "frame": p.frame,
+                    "fps": p.fps,
+                    "bitrate": p.bitrate,
+                    "time": p.time,
+                    "speed": p.speed,
+                    "size": p.size,
+                }))
+            }
+        });
+
         let payload = match status_result {
             Ok(v) => json!({
                 "payload": {
@@ -210,6 +228,8 @@ pub async fn run_stream_status_publisher(
                     "from": agent_name,
                     "service": config.stream_service_name,
                     "active": v.get("active").and_then(|a| a.as_bool()).unwrap_or(false),
+                    "rtmp_url": rtmp_url,
+                    "progress": progress_json,
                     "timestamp": iso_now(),
                 }
             }),
@@ -218,6 +238,7 @@ pub async fn run_stream_status_publisher(
                     "type": "stream-status",
                     "from": agent_name,
                     "service": config.stream_service_name,
+                    "rtmp_url": rtmp_url,
                     "error": e.to_string(),
                     "timestamp": iso_now(),
                 }
