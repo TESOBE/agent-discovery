@@ -37,6 +37,8 @@ pub struct Config {
     pub watchdog_probe_interval_secs: u64,
     /// systemd unit name running the ffmpeg stream.
     pub stream_service_name: String,
+    /// If true, start the stream service automatically when the agent boots.
+    pub auto_start_stream: bool,
     /// Seconds between `system-commands` channel polls.
     pub system_command_poll_interval_secs: u64,
 }
@@ -105,6 +107,9 @@ impl Config {
                 .context("WATCHDOG_PROBE_INTERVAL_SECS must be a positive integer")?,
             stream_service_name: std::env::var("STREAM_SERVICE_NAME")
                 .unwrap_or_else(|_| "stream.service".into()),
+            auto_start_stream: std::env::var("AUTO_START_STREAM")
+                .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off" | ""))
+                .unwrap_or(true),
             system_command_poll_interval_secs: std::env::var("SYSTEM_COMMAND_POLL_INTERVAL_SECS")
                 .unwrap_or_else(|_| "10".into())
                 .parse()

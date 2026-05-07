@@ -533,6 +533,17 @@ pub async fn run(config: Config, udp_only: bool) -> Result<()> {
         }.instrument(agent_span.clone()));
     }
 
+    // Auto-start the ffmpeg stream service on boot (opt-out via AUTO_START_STREAM=false).
+    if config.auto_start_stream {
+        let service = config.stream_service_name.clone();
+        tokio::spawn(async move {
+            match crate::system_commands::stream::start(&service).await {
+                Ok(v) => tracing::info!(service = %service, result = %v, "Auto-started stream service"),
+                Err(e) => tracing::warn!(service = %service, error = %e, "Auto-start of stream service failed"),
+            }
+        }.instrument(agent_span.clone()));
+    }
+
     // Reachability watchdog: force hotspot re-join after prolonged OBP loss.
     // Probes every configured host so failure means *all* hosts are unreachable.
     {
